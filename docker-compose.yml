@@ -1,0 +1,79 @@
+services:
+  # OpenClaw Voice Orchestrator (main service)
+  openclaw-voice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openclaw-voice
+    
+    depends_on:
+      - whisper
+      - piper
+    
+    environment:
+      # Gateway configuration
+      GATEWAY_URL: ${GATEWAY_URL:-http://openclaw-gateway:18789}
+      GATEWAY_HOOK_TOKEN: ${GATEWAY_HOOK_TOKEN:-your-secure-token}
+      GATEWAY_AGENT_ID: assistant
+      GATEWAY_SESSION_PREFIX: "voice:"
+      
+      # STT configuration
+      WHISPER_URL: http://whisper:8080
+      WHISPER_LANGUAGE: en
+      WHISPER_MODEL: base
+      
+      # TTS configuration
+      PIPER_URL: http://piper:5000
+      PIPER_VOICE_ID: en_US-amy-medium
+      
+      # Audio configuration
+      AUDIO_DEVICE: default
+      AUDIO_SAMPLE_RATE: 16000
+      
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    
+    # Mount PulseAudio for audio capture/playback
+    volumes:
+      # PulseAudio socket (Linux)
+      - /run/user/1000/pulse:/run/user/1000/pulse:ro
+      # ALSA config (fallback)
+      - /etc/alsa:/etc/alsa:ro
+    
+    # Audio device access
+    devices:
+      - /dev/snd:/dev/snd
+    
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Whisper STT service
+  whisper:
+    restart: unless-stopped
+    build:
+      context: ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/whisper
+      dockerfile: Dockerfile
+    ports:
+      - "8086:8080"
+    environment:
+      - WHISPER_MODEL=base
+      - WHISPER_DEVICE=cpu
+      - HSA_ENABLE_SDMA=0
+      - AMD_SERIALIZE_KERNEL=3
+
+  # Piper TTS HTTP service
+  piper:
+    restart: unless-stopped
+    build:
+      context: ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/piper1-gpl
+      dockerfile: Dockerfile
+    command: ["server", "--model", "en_US-amy-medium"]
+    ports:
+      - "5002:5000"
+    volumes:
+      - ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/piper-models:/home/piper/.local/share/piper
+      - ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/piper-data:/data
