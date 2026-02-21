@@ -112,16 +112,29 @@ export class TTSClient {
    * Stop current audio playback (for cut-in)
    * Kills the playback process immediately
    */
-  stopPlayback(): void {
+  stopPlayback(requestTimeHR?: bigint): void {
+    const stopReceiveTimeHR = process.hrtime.bigint();
+    const timeSinceRequestMicros = requestTimeHR ? Number(stopReceiveTimeHR - requestTimeHR) / 1000 : 0;
+    
     if (this.currentPlaybackProcess && !this.currentPlaybackProcess.killed) {
+      const sigTermTimeHR = process.hrtime.bigint();
+      process.stderr.write(`[CUT-IN-LATENCY] 🛑 Sending SIGTERM to PID=${this.currentPlaybackProcess.pid} (request latency=${timeSinceRequestMicros.toFixed(2)}µs)\n`);
       this.currentPlaybackProcess.kill('SIGTERM');
-      // Force kill if SIGTERM doesn't work
+      
+      // Force kill if SIGTERM doesn't work - check immediately
       setTimeout(() => {
         if (this.currentPlaybackProcess && !this.currentPlaybackProcess.killed) {
+          const killTimeHR = process.hrtime.bigint();
+          const timeToKill = Number(killTimeHR - sigTermTimeHR) / 1000;
+          process.stderr.write(`[CUT-IN-LATENCY] 💣 SIGTERM ineffective, sending SIGKILL to PID=${this.currentPlaybackProcess.pid} (${timeToKill.toFixed(2)}µs after SIGTERM)\n`);
           this.currentPlaybackProcess.kill('SIGKILL');
         }
-      }, 100);
+      }, 50); // More aggressive timeout
+      
       this.isSpeakingNow = false;
+      process.stderr.write(`[CUT-IN-LATENCY] ✓ Playback stop sequence initiated (total latency=${(timeSinceRequestMicros/1000).toFixed(2)}ms)\n`);
+    } else {
+      process.stderr.write('[TTS] No active playback process to stop\n');
     }
     this.cleanupTempFile();
   }

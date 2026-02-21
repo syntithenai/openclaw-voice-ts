@@ -65,6 +65,9 @@ services:
       WAKE_WORD: ${WAKE_WORD}
       WAKE_WORD_TIMEOUT: ${WAKE_WORD_TIMEOUT}
       SLEEP_PHRASE: ${SLEEP_PHRASE}
+
+      # Voice control HTTP server
+      VOICE_HTTP_PORT: ${VOICE_HTTP_PORT:-18910}
       
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -88,6 +91,8 @@ services:
       - audio
     
     restart: unless-stopped
+    ports:
+      - "${VOICE_HTTP_PORT:-18910}:${VOICE_HTTP_PORT:-18910}"
     logging:
       driver: "json-file"
       options:

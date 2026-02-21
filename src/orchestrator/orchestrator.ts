@@ -21,6 +21,7 @@ export interface OrchestratorConfig {
   agentId: string;
   whisperUrl?: string;
   whisperLanguage?: string;
+  whisperModel?: string;
   piperUrl?: string;
   piperVoiceId?: string;
   audioDevice?: string;
@@ -39,7 +40,8 @@ export interface OrchestratorConfig {
   vadAbsoluteSilenceRms?: number;
   cutInAbsoluteRms?: number;
   cutInMinSpeechMs?: number;
-  wakeWord?: string;
+  ttsDedupeWindowMs?: number;
+  wakeWord?: string | string[];
   wakeWordTimeout?: number;
   sleepPhrase?: string;
 }
@@ -55,11 +57,15 @@ export class VoiceOrchestrator {
   private isRunning: boolean = false;
   private shouldExit: boolean = false;
   private pendingAssistantResponse: string | null = null;
+  private captureEnabled: boolean = true;
+  private ttsHealthy: boolean | null = null;
+  private whisperHealthy: boolean | null = null;
   
   // Queue-based architecture for non-blocking operation
   private messageQueue: string[] = [];
   private ttsQueue: TTSDirective[] = [];
-  private lastQueuedTTSText: string = ''; // Track to prevent duplicate sentence starts
+  private lastQueuedTTSText: string = '';
+  private lastQueuedTTSAt: number = 0;
   private gatewayTextBuffer: string = ''; // Buffer partial text until sentence completes
   private gatewayFlushTimeout: NodeJS.Timeout | null = null; // Flush buffer after timeout
   
@@ -74,6 +80,7 @@ export class VoiceOrchestrator {
   // Wake word timeout state
   private isAwake: boolean = true;
   private lastActivityTime: number = Date.now();
+  private lastTtsActivityTime: number = 0;
   
   constructor(
     private config: OrchestratorConfig,
@@ -109,21 +116,8 @@ export class VoiceOrchestrator {
       const text = this.extractTextFromMessage(message);
       if (text.trim()) {
         // Gateway sends COMPLETE text each time (not deltas)
-        // Check if this is the same text we already have
-        if (text === this.gatewayTextBuffer) {
-          // Exact duplicate, skip
-          return;
-        }
-        
-        // Check if text is an extension of what we have (text continuation)
-        // If the new text starts with our buffer, it's an update to same message
-        if (text.startsWith(this.gatewayTextBuffer) && text.length > this.gatewayTextBuffer.length) {
-          // Update existing buffer (new characters appended)
-          this.gatewayTextBuffer = text;
-        } else {
-          // This is a new/different message, replace buffer
-          this.gatewayTextBuffer = text;
-        }
+        // Always replace buffer with latest text
+        this.gatewayTextBuffer = text;
         
         // Check if we have sentence-ending punctuation
         const sentenceMatch = this.gatewayTextBuffer.match(/(.+?[.!?])\s*$/);
@@ -139,23 +133,24 @@ export class VoiceOrchestrator {
             this.gatewayFlushTimeout = null;
           }
           
-          // Extract first few words of this sentence and previous one
+          const windowMs = this.config.ttsDedupeWindowMs ?? 800;
+          const now = Date.now();
+          const isWithinWindow = windowMs > 0 && (now - this.lastQueuedTTSAt) <= windowMs;
           const getLeadingWords = (s: string): string => {
             const words = s.split(/\s+/).slice(0, 3).join(' ');
             return words.toLowerCase();
           };
-          
           const thisSentenceStart = getLeadingWords(completeSentence);
           const prevSentenceStart = getLeadingWords(this.lastQueuedTTSText);
-          
-          // Only queue if this sentence doesn't start the same way as the last one
-          if (thisSentenceStart !== prevSentenceStart) {
+
+          if (isWithinWindow && thisSentenceStart === prevSentenceStart) {
+            this.logger.info(`[GATEWAY-SENTENCE] Duplicate shard within ${windowMs}ms, skipped: "${completeSentence.substring(0, 80)}..."`);
+          } else {
             this.logger.info(`[GATEWAY-SENTENCE] Queuing: "${completeSentence.substring(0, 80)}..."`);
             this.lastQueuedTTSText = completeSentence;
+            this.lastQueuedTTSAt = now;
             const directives = this.parseTTSDirectives(completeSentence);
             this.ttsQueue.push(...directives);
-          } else {
-            this.logger.info(`[GATEWAY-SENTENCE] Duplicate start, skipped: "${completeSentence.substring(0, 80)}..."`);
           }
         } else if (this.gatewayTextBuffer.trim().length > 20) {
           // Text is accumulating - set timeout to flush if no sentence end comes
@@ -163,10 +158,25 @@ export class VoiceOrchestrator {
             this.gatewayFlushTimeout = setTimeout(() => {
               if (this.gatewayTextBuffer.trim()) {
                 const hesitant = this.gatewayTextBuffer.trim();
-                this.logger.info(`[GATEWAY-SENTENCE] Timeout flush (no punctuation): "${hesitant.substring(0, 80)}..."`);
-                const directives = this.parseTTSDirectives(hesitant);
-                this.ttsQueue.push(...directives);
-                this.lastQueuedTTSText = hesitant;
+                const windowMs = this.config.ttsDedupeWindowMs ?? 800;
+                const now = Date.now();
+                const isWithinWindow = windowMs > 0 && (now - this.lastQueuedTTSAt) <= windowMs;
+                const getLeadingWords = (s: string): string => {
+                  const words = s.split(/\s+/).slice(0, 3).join(' ');
+                  return words.toLowerCase();
+                };
+                const thisSentenceStart = getLeadingWords(hesitant);
+                const prevSentenceStart = getLeadingWords(this.lastQueuedTTSText);
+
+                if (isWithinWindow && thisSentenceStart === prevSentenceStart) {
+                  this.logger.info(`[GATEWAY-SENTENCE] Timeout duplicate shard within ${windowMs}ms, skipped: "${hesitant.substring(0, 80)}..."`);
+                } else {
+                  this.logger.info(`[GATEWAY-SENTENCE] Timeout flush (no punctuation): "${hesitant.substring(0, 80)}..."`);
+                  const directives = this.parseTTSDirectives(hesitant);
+                  this.ttsQueue.push(...directives);
+                  this.lastQueuedTTSText = hesitant;
+                  this.lastQueuedTTSAt = now;
+                }
                 this.gatewayTextBuffer = '';
               }
               this.gatewayFlushTimeout = null;
@@ -224,13 +234,17 @@ export class VoiceOrchestrator {
       this.logger.info('Connected to gateway');
       
       // Health check TTS
-      if (!await this.ttsClient.healthCheck()) {
+      this.ttsHealthy = await this.ttsClient.healthCheck();
+      if (!this.ttsHealthy) {
         this.logger.warn('TTS service not responding, speech playback may fail');
       }
 
       // Health check Whisper
-      if (this.whisperClient && !(await this.whisperClient.healthCheck())) {
-        this.logger.warn('Whisper service not responding, transcription may fail');
+      if (this.whisperClient) {
+        this.whisperHealthy = await this.whisperClient.healthCheck();
+        if (!this.whisperHealthy) {
+          this.logger.warn('Whisper service not responding, transcription may fail');
+        }
       }
       
       // Start continuous audio stream ONCE
@@ -266,6 +280,64 @@ export class VoiceOrchestrator {
     this.shouldExit = true;
     this.isRunning = false;
   }
+
+  setCaptureEnabled(enabled: boolean): void {
+    if (this.captureEnabled === enabled) {
+      return;
+    }
+    this.captureEnabled = enabled;
+    if (!enabled) {
+      const clearedFrames = this.audioBuffer.length;
+      this.audioBuffer = [];
+      this.logger.info(`[CONTROL] Capture disabled (cleared ${clearedFrames} frames)`);
+      this.setStateChange('idle');
+      return;
+    }
+    this.logger.info('[CONTROL] Capture enabled');
+  }
+
+  setAwakeState(awake: boolean): void {
+    if (this.isAwake === awake) {
+      return;
+    }
+    this.isAwake = awake;
+    this.lastActivityTime = Date.now();
+    if (!awake) {
+      this.logger.info('[CONTROL] Sleep requested');
+      this.ttsQueue = [];
+      if (this.ttsClient.isSpeaking()) {
+        this.ttsClient.stopPlayback();
+      }
+    } else {
+      this.logger.info('[CONTROL] Wake requested');
+    }
+  }
+
+  getStatus(): Record<string, unknown> {
+    return {
+      isRunning: this.isRunning,
+      captureEnabled: this.captureEnabled,
+      isAwake: this.isAwake,
+      currentState: this.currentState,
+      ttsSpeaking: this.ttsClient.isSpeaking(),
+      ttsQueueSize: this.ttsQueue.length,
+      messageQueueSize: this.messageQueue.length,
+      lastActivityTime: this.lastActivityTime,
+      lastTtsActivityTime: this.lastTtsActivityTime,
+      models: {
+        piperVoiceId: this.config.piperVoiceId,
+        whisperModel: this.config.whisperModel,
+        whisperLanguage: this.config.whisperLanguage,
+      },
+      readiness: {
+        ttsHealthy: this.ttsHealthy,
+        whisperHealthy: this.whisperHealthy,
+      },
+      wakeWord: this.config.wakeWord,
+      wakeWordTimeout: this.config.wakeWordTimeout,
+      sleepPhrase: this.config.sleepPhrase,
+    };
+  }
   
   /**
    * Audio buffer task - continuously drains audio stream to prevent parecord blocking
@@ -276,6 +348,7 @@ export class VoiceOrchestrator {
     let frameCount = 0;
     let droppedFrames = 0;
     let lastLogTime = Date.now();
+    let lastFrameCount = 0;
     
     while (this.isRunning && !this.shouldExit) {
       try {
@@ -287,6 +360,11 @@ export class VoiceOrchestrator {
         for await (const frame of this.audioStream) {
           if (this.shouldExit) {
             break;
+          }
+
+          if (!this.captureEnabled) {
+            frameCount++;
+            continue;
           }
           
           frameCount++;
@@ -306,8 +384,11 @@ export class VoiceOrchestrator {
           
           // Log stats periodically
           if (Date.now() - lastLogTime > 10000) {
-            this.logger.debug(`Audio buffer: ${this.audioBuffer.length} frames, total: ${frameCount}, dropped: ${droppedFrames}`);
+            const framesThisInterval = frameCount - lastFrameCount;
+            const isTTSPlaying = this.currentState === 'speaking';
+            this.logger.info(`[BUFFER] ${frameCount} total frames captured (${framesThisInterval}/10s), buffer size: ${this.audioBuffer.length}/${this.maxBufferFrames}, dropped: ${droppedFrames}, TTS playing: ${isTTSPlaying}`);
             lastLogTime = Date.now();
+            lastFrameCount = frameCount;
           }
         }
         
@@ -343,6 +424,10 @@ export class VoiceOrchestrator {
     
     while (this.isRunning && !this.shouldExit) {
       try {
+        if (!this.captureEnabled) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+          continue;
+        }
         // Skip capture while TTS is playing
         if (this.currentState === 'speaking') {
           await new Promise(resolve => setTimeout(resolve, 50));
@@ -387,8 +472,14 @@ export class VoiceOrchestrator {
     while (this.isRunning && !this.shouldExit) {
       try {
         // Check wake word timeout if configured
-        if (this.config.wakeWordTimeout && this.isAwake) {
-          const timeSinceActivity = Date.now() - this.lastActivityTime;
+        if (this.config.wakeWordTimeout && this.isAwake && this.hasWakeWordConfigured()) {
+          // Prevent timeout from firing while TTS is generating or speaking
+          if (this.currentState === 'speaking' || this.ttsClient.isSpeaking()) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+            continue;
+          }
+          const baseTime = this.lastTtsActivityTime || this.lastActivityTime;
+          const timeSinceActivity = Date.now() - baseTime;
           if (timeSinceActivity > this.config.wakeWordTimeout) {
             this.isAwake = false;
             this.logger.info(`Wake word timeout: ${timeSinceActivity}ms since last activity. Going to sleep.`);
@@ -427,7 +518,7 @@ export class VoiceOrchestrator {
             // Check if system is asleep
             if (!this.isAwake) {
               // If wake word is configured, check for it
-              if (this.config.wakeWord) {
+              if (this.hasWakeWordConfigured()) {
                 if (this.containsWakeWord(message)) {
                   this.isAwake = true;
                   this.lastActivityTime = Date.now();
@@ -481,20 +572,50 @@ export class VoiceOrchestrator {
             
             // STATE: SPEAKING
             this.setStateChange('speaking');
-            await this.playWithCutIn(directive);
+            const wasCutIn = await this.playWithCutIn(directive);
             
-            this.logger.info(`[TTS-END] Playback completed, waiting for audio echo to clear...`);
-            
-            // Wait a moment for TTS audio to fully clear from the microphone
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-            // Clear audio buffer again to remove any TTS echo or concurrent audio capture
-            const postPlayBufferSize = this.audioBuffer.length;
-            this.audioBuffer = [];
-            this.logger.info(`[TTS-END] Cleared ${postPlayBufferSize} frames captured during TTS`);
-            
-            // Return to listening state after TTS finishes
-            this.setStateChange('listening');
+            if (wasCutIn) {
+              // Cut-in detected - user interrupted TTS
+              this.logger.info('[CUT-IN] Handling cut-in interruption');
+              
+              // Skip echo wait - user is already speaking
+              // Keep a short pre-roll so we can capture the user's cut-in speech
+              const cutInPreRollMs = this.config.preRollMs ?? 300;
+              const lastFrame = this.audioBuffer[this.audioBuffer.length - 1];
+              const frameMs = lastFrame ? this.frameDurationMs(lastFrame) : 20;
+              const keepFrames = Math.max(1, Math.floor(cutInPreRollMs / frameMs));
+              const preTrimSize = this.audioBuffer.length;
+              if (preTrimSize > keepFrames) {
+                this.audioBuffer = this.audioBuffer.slice(preTrimSize - keepFrames);
+              }
+              this.logger.info(`[CUT-IN] Preserved ${this.audioBuffer.length}/${preTrimSize} frames (~${cutInPreRollMs}ms) for cut-in capture`);
+              
+              // Start wake timeout from TTS cancellation
+              this.lastActivityTime = Date.now();
+              this.lastTtsActivityTime = this.lastActivityTime;
+
+              // State back to listening - user speech will be captured
+              this.setStateChange('listening');
+              
+            } else {
+              // Normal completion - wait for echo to clear
+              this.logger.info(`[TTS-END] Playback completed, waiting for audio echo to clear...`);
+              
+              // Wait a moment for TTS audio to fully clear from the microphone
+              await new Promise(resolve => setTimeout(resolve, 500));
+              
+              // Clear audio buffer again to remove any TTS echo or concurrent audio capture
+              const postPlayBufferSize = this.audioBuffer.length;
+              this.audioBuffer = [];
+              this.logger.info(`[TTS-END] Cleared ${postPlayBufferSize} frames captured during TTS`);
+
+              // Start wake timeout from TTS completion
+              this.lastActivityTime = Date.now();
+              this.lastTtsActivityTime = this.lastActivityTime;
+              
+              // Return to listening state after TTS finishes
+              this.setStateChange('listening');
+            }
           }
         }
         
@@ -507,6 +628,9 @@ export class VoiceOrchestrator {
         const errorBufferSize = this.audioBuffer.length;
         this.audioBuffer = [];
         this.logger.warn(`[TTS-ERROR] Cleared ${errorBufferSize} frames on error`);
+        // Start wake timeout from TTS failure
+        this.lastActivityTime = Date.now();
+        this.lastTtsActivityTime = this.lastActivityTime;
         this.setStateChange('listening');
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
@@ -549,88 +673,138 @@ export class VoiceOrchestrator {
   
   /**
    * Play audio with cut-in support
-   * Kills playback if user starts speaking
+   * Returns true if cut-in was detected, false if playback completed normally
    */
-  private async playWithCutIn(directive: TTSDirective): Promise<void> {
+  private async playWithCutIn(directive: TTSDirective): Promise<boolean> {
+    let cutInDetected = false;
+    const playStartHR = process.hrtime.bigint();
     try {
       // Synthesize audio
+      const synStartHR = process.hrtime.bigint();
       const audioBuffer = await this.ttsClient.synthesize(
         directive.text,
         directive.voiceId,
         directive.rate,
         directive.stability
       );
+      const synDurationMS = Number(process.hrtime.bigint() - synStartHR) / 1_000_000;
+      this.logger.info(`[CUT-IN-LATENCY] Synthesis took ${synDurationMS.toFixed(2)}ms for ${audioBuffer.length} bytes`);
+      
+      this.logger.info(`[CUT-IN] Starting TTS playback (${audioBuffer.length} bytes)`);
       
       // Start playback in background
       const playbackPromise = this.ttsClient.playAudio(audioBuffer);
 
-       // In file-input test mode, skip cut-in detection
+      // In file-input test mode, skip cut-in detection
       if (this.config.audioInputFile) {
         await playbackPromise;
-        return;
+        return false;
       }
       
       // Monitor for cut-in while playing
+      const monitorStartHR = process.hrtime.bigint();
       const cutInPromise = this.monitorForCutIn();
       
       // Whichever finishes first wins
-      await Promise.race([playbackPromise, cutInPromise]);
+      const raceStartHR = process.hrtime.bigint();
+      const winner = await Promise.race([
+        playbackPromise.then(() => 'playback'),
+        cutInPromise.then(() => 'cutin')
+      ]);
+      const raceDurationMicros = Number(process.hrtime.bigint() - raceStartHR) / 1000;
       
-      // If cut-in detected, stop playback
-      if (this.ttsClient.isSpeaking()) {
-        this.logger.info('Cut-in detected, stopping playback');
-        this.ttsClient.stopPlayback();
+      // If cut-in detected, stop playback IMMEDIATELY
+      if (winner === 'cutin') {
+        const stopStartHR = process.hrtime.bigint();
+        cutInDetected = true;
+        this.logger.info(`[CUT-IN-LATENCY] Race finished at ${(raceDurationMicros/1000).toFixed(2)}ms: CUTIN WON`);
+        this.logger.info('[CUT-IN] ⚡ Speech detected - stopping TTS immediately');
+        if (this.ttsClient.isSpeaking()) {
+          this.ttsClient.stopPlayback(stopStartHR); // Pass timing reference
+        }
+      } else {
+        this.logger.info(`[CUT-IN-LATENCY] Race finished at ${(raceDurationMicros/1000).toFixed(2)}ms: PLAYBACK WON`);
+        this.logger.info('[TTS] ✓ Playback completed normally');
       }
       
     } catch (error) {
       this.logger.error('Error in playback/cut-in:', error);
     }
+    
+    return cutInDetected;
   }
   
   /**
    * Monitor for speech during playback (cut-in detection)
+   * Uses direct RMS threshold instead of VAD state machine for immediate response
+   * Tracks detailed latency at each step
    */
   private async monitorForCutIn(): Promise<void> {
-    const cutInVad = new VoiceActivityDetector(this.audioCapture.getSampleRate(), {
-      silenceThreshold: this.config.vadSilenceThreshold,
-      absoluteSpeechRms: this.config.cutInAbsoluteRms ?? this.config.vadAbsoluteRms,
-      absoluteSilenceRms: this.config.vadAbsoluteSilenceRms,
-      noiseFloorThreshold: this.config.vadNoiseFloorThreshold,
-      minSpeechDuration: this.config.cutInMinSpeechMs ?? this.config.vadMinSpeechMs,
-      minSilenceDuration: this.config.vadMinSilenceMs,
-    });
-    cutInVad.reset();
+    const cutInRmsThreshold = this.config.cutInAbsoluteRms ?? this.config.vadAbsoluteRms ?? 0.002;
+    const minFramesAboveThreshold = Math.max(1, Math.floor((this.config.cutInMinSpeechMs ?? 50) / 20)); // ~50ms = 2-3 frames at 20ms
+    const monitorStartTime = Date.now();
+    const monitorStartHR = process.hrtime.bigint();
+    
+    this.logger.info(`[CUT-IN] Starting cut-in monitor with RMS threshold=${cutInRmsThreshold.toFixed(6)}, min speech=${minFramesAboveThreshold} frames`);
     
     let lastBufferIndex = this.audioBuffer.length;
+    let framesAboveThreshold = 0;
+    let frameCount = 0;
+    let firstHighRmsTime = 0n; // High-resolution time of first high-RMS frame
     
     // Monitor audio buffer for cut-in instead of creating new stream
     while (this.isRunning && !this.shouldExit) {
       // Wait for new frames in buffer
       if (lastBufferIndex >= this.audioBuffer.length) {
-        await new Promise(resolve => setTimeout(resolve, 10));
+        await new Promise(resolve => setTimeout(resolve, 5)); // More responsive monitoring
         continue;
       }
       
-      // Process new frames
+      // Process new frames with simple RMS threshold
       while (lastBufferIndex < this.audioBuffer.length) {
+        const frameCheckTimeHR = process.hrtime.bigint();
         const frame = this.audioBuffer[lastBufferIndex];
         lastBufferIndex++;
+        frameCount++;
         
         if (!frame) {
+          framesAboveThreshold = 0;
           continue;
         }
         
-        const hasSpeech = cutInVad.analyze(frame);
+        // Calculate RMS of frame
+        const rmsCalcStartHR = process.hrtime.bigint();
+        const rms = this.calculateRms(frame);
+        const rmsCalcDurationMicros = Number(process.hrtime.bigint() - rmsCalcStartHR) / 1000;
         
-        // Immediate cut-in on speech detection
-        if (hasSpeech) {
-          this.logger.debug('Cut-in speech detected');
-          return;
+        // Direct RMS threshold check - no VAD state needed
+        if (rms >= cutInRmsThreshold) {
+          if (framesAboveThreshold === 0) {
+            // First high-RMS frame detected
+            firstHighRmsTime = frameCheckTimeHR;
+            this.logger.info(`[CUT-IN-LATENCY] ⚡ First high-RMS detected: RMS=${rms.toFixed(6)} (threshold=${cutInRmsThreshold.toFixed(6)}) at frame ${frameCount} (${rmsCalcDurationMicros.toFixed(2)}µs to calc)`);
+          }
+          framesAboveThreshold++;
+          
+          // If we have enough consecutive high-RMS frames, it's definitely speech
+          if (framesAboveThreshold >= minFramesAboveThreshold) {
+            const decisionTimeHR = process.hrtime.bigint();
+            const timeSinceFirstHighRms = Number(decisionTimeHR - firstHighRmsTime) / 1000; // micros
+            const timeSinceMonitorStart = Number(decisionTimeHR - monitorStartHR) / 1000; // micros
+            this.logger.info(`[CUT-IN-LATENCY] ✂️  Cut-in decision triggered: accumulated ${framesAboveThreshold} high-RMS frames, time from 1st high-RMS=${timeSinceFirstHighRms.toFixed(2)}µs, total monitor time=${timeSinceMonitorStart.toFixed(2)}µs (${(timeSinceMonitorStart/1000).toFixed(2)}ms)`);
+            return;
+          }
+        } else {
+          if (framesAboveThreshold > 0) {
+            this.logger.info(`[CUT-IN-LATENCY] ↓ Low-RMS detected: RMS=${rms.toFixed(6)}, resetting counter (had ${framesAboveThreshold} high-RMS frames)`);
+          }
+          // Reset counter if we drop below threshold
+          framesAboveThreshold = 0;
         }
       }
       
       // Small delay between checks
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await new Promise(resolve => setTimeout(resolve, 5)); // More responsive
     }
   }
   
@@ -642,6 +816,16 @@ export class VoiceOrchestrator {
       this.logger.info(`State: ${this.currentState} → ${newState}`);
       this.currentState = newState;
     }
+  }
+
+  private hasWakeWordConfigured(): boolean {
+    if (!this.config.wakeWord) {
+      return false;
+    }
+    if (Array.isArray(this.config.wakeWord)) {
+      return this.config.wakeWord.some(word => word.trim().length > 0);
+    }
+    return this.config.wakeWord.trim().length > 0;
   }
 
   private async captureSpeechAudio(): Promise<Buffer | null> {
@@ -662,10 +846,21 @@ export class VoiceOrchestrator {
     try {
       // Read from circular buffer
       while (this.isRunning && !this.shouldExit) {
+        // CRITICAL: Exit immediately if state changes to 'speaking' to allow TTS cut-in detection
+        if (this.currentState !== 'idle' && this.currentState !== 'listening' && this.currentState !== 'sending') {
+          this.logger.debug('[CAPTURE] Exiting captureSpeechAudio - state changed to ' + this.currentState);
+          return null;
+        }
+        
         // Wait for frames to be available in buffer
         while (this.audioBuffer.length === 0) {
           if (this.shouldExit) {
             break;
+          }
+          // Check state again while waiting
+          if (this.currentState !== 'idle' && this.currentState !== 'listening' && this.currentState !== 'sending') {
+            this.logger.debug('[CAPTURE] Exiting frame wait - state changed during wait');
+            return null;
           }
           await new Promise(resolve => setTimeout(resolve, 10));
           
@@ -782,12 +977,23 @@ export class VoiceOrchestrator {
    * Check if transcript contains wake word (case-insensitive partial match)
    */
   private containsWakeWord(text: string): boolean {
-    if (!this.config.wakeWord) {
+    const wakeWordConfig = this.config.wakeWord;
+    if (!this.hasWakeWordConfigured() || !wakeWordConfig) {
       return false;
     }
-    const normalizedText = text.toLowerCase().trim();
-    const normalizedWakeWord = this.config.wakeWord.toLowerCase().trim();
-    return normalizedText.includes(normalizedWakeWord);
+    const normalize = (value: string): string => value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const normalizedText = normalize(text);
+    const wakeWords = Array.isArray(wakeWordConfig)
+      ? wakeWordConfig
+      : [wakeWordConfig];
+    return wakeWords
+      .map(word => normalize(word))
+      .filter(word => word.length > 0)
+      .some(word => normalizedText.includes(word));
   }
   
   /**
@@ -795,7 +1001,7 @@ export class VoiceOrchestrator {
    * Matches variations like "go to sleep", "going to sleep", "go sleep", etc.
    */
   private shouldGoToSleep(text: string): boolean {
-    if (!this.config.sleepPhrase) {
+    if (!this.config.sleepPhrase || !this.hasWakeWordConfigured()) {
       return false;
     }
     
