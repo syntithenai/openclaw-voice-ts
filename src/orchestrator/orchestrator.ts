@@ -1,6 +1,7 @@
 import { AudioCapture } from '../audio/capture';
 import { VoiceActivityDetector } from '../audio/vad';
 import { encodeWav } from '../audio/wav';
+import { generateClickSound } from '../audio/sounds';
 import { GatewayWSClient } from '../gateway/ws-client';
 import { ResponseParser, TTSDirective } from '../gateway/parser';
 import { WhisperClient } from '../stt/whisper';
@@ -24,11 +25,9 @@ export interface OrchestratorConfig {
   whisperModel?: string;
   piperUrl?: string;
   piperVoiceId?: string;
-  audioDevice?: string;
+  audioCaptureDevice?: string;
+  audioPlaybackDevice?: string;
   sampleRate?: number;
-  audioInputFile?: string;
-  audioInputFormat?: 'wav' | 'raw';
-  audioInputLoop?: boolean;
   maxListenMs?: number;
   preRollMs?: number;
   vadSilenceThreshold?: number;
@@ -44,6 +43,8 @@ export interface OrchestratorConfig {
   wakeWord?: string | string[];
   wakeWordTimeout?: number;
   sleepPhrase?: string;
+  audioInputFile?: string;
+  audioInputLoop?: boolean;
 }
 
 export class VoiceOrchestrator {
@@ -82,6 +83,9 @@ export class VoiceOrchestrator {
   private lastActivityTime: number = Date.now();
   private lastTtsActivityTime: number = 0;
   
+  // Wake word audio feedback
+  private wakeClickSound: Buffer;
+  
   constructor(
     private config: OrchestratorConfig,
     logger?: Logger
@@ -90,10 +94,8 @@ export class VoiceOrchestrator {
     
     this.audioCapture = new AudioCapture(
       config.sampleRate || 16000,
-      config.audioDevice || 'default',
-      1024,
-      config.audioInputFile,
-      config.audioInputFormat || 'wav'
+      config.audioCaptureDevice || 'default',
+      1024
     );
     
     this.vad = new VoiceActivityDetector(config.sampleRate || 16000, {
@@ -196,8 +198,12 @@ export class VoiceOrchestrator {
 
     this.ttsClient = new TTSClient(
       config.piperUrl || 'http://piper:5002',
-      config.piperVoiceId || 'en_US-amy-medium'
+      config.piperVoiceId || 'en_US-amy-medium',
+      config.audioPlaybackDevice
     );
+    
+    // Pre-generate wake word click sound
+    this.wakeClickSound = generateClickSound(config.sampleRate || 16000, 50, 800);
   }
   
   /**
@@ -523,6 +529,12 @@ export class VoiceOrchestrator {
                   this.isAwake = true;
                   this.lastActivityTime = Date.now();
                   this.logger.info('Wake word detected. Waking up.');
+                  
+                  // Play wake word click sound (non-blocking)
+                  this.ttsClient.playAudio(this.wakeClickSound).catch((err) => {
+                    this.logger.debug('Failed to play wake click sound:', err);
+                  });
+                  
                   // Send the message that contains wake word
                 } else {
                   this.logger.debug('Skipping message - system is asleep and no wake word detected');

@@ -1,4 +1,4 @@
-import { ChatMessage } from './client';
+import { ChatMessage } from './ws-client';
 
 /**
  * Parse TTS directives from agent responses

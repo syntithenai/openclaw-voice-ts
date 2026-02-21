@@ -41,23 +41,24 @@ nano .env
 ```
 
 **Required Variables:**
-- `GATEWAY_URL=http://localhost:18789`
-- `GATEWAY_HOOK_TOKEN=your-bearer-token`
+- `GATEWAY_URL=ws://localhost:18789`
+- `GATEWAY_AUTH_TOKEN=your-bearer-token`
 - `GATEWAY_AGENT_ID=assistant`
 
 **Optional:**
 - `PIPER_URL=http://piper:5002` (default)
-- `AUDIO_DEVICE=default` (default)
+- `AUDIO_CAPTURE_DEVICE=default` (capture device)
+- `AUDIO_PLAYBACK_DEVICE=default` (ALSA playback device)
 - `LOG_LEVEL=info` (default: info, debug|warn|error)
 
 ## Project Structure
 
 ```
 src/
-  ├── audio/          # PulseAudio capture + VAD
-  │   ├── capture.ts  # 90 LOC - Stream audio frames
-  │   └── vad.ts      # 150 LOC - Detect speech
-  ├── gateway/        # HTTP hooks to OpenClaw
+  ├── audio/          # Audio capture + VAD
+  │   ├── capture.ts  # Platform-agnostic factory
+  │   └── vad.ts      # Voice activity detection
+  ├── gateway/        # WebSocket connection to OpenClaw
   │   ├── client.ts   # 110 LOC - POST & GET endpoints
   │   └── parser.ts   # 110 LOC - Extract TTS directives
   ├── tts/            # Piper integration
@@ -145,23 +146,21 @@ console.log(orchestrator.getState()); // 'listening' | 'sending' | etc
 
 ## API Integration
 
-### Send Transcription
-```http
-POST /hooks/agent
-Authorization: Bearer {token}
-Content-Type: application/json
+The voice service communicates with OpenClaw Gateway via WebSocket for real-time bidirectional messaging.
 
-{
-  "sessionKey": "voice:123",
-  "agentId": "assistant",
-  "userMessage": "Hello, what is the weather?"
-}
-```
+### WebSocket Connection
+```typescript
+const client = new GatewayWSClient({
+  gatewayUrl: 'ws://localhost:18789',
+  token: 'your-auth-token',
+  sessionKey: 'voice:123'
+});
 
-### Get Response
-```http
-GET /chat.history?sessionKey=voice:123&limit=10
-Authorization: Bearer {token}
+connect();
+client.sendMessage('Hello, what is the weather?');
+client.on('assistant-message', (message) => {
+  console.log('Agent responded:', message);
+});
 ```
 
 ## TTS Directives
@@ -182,8 +181,8 @@ Example from agent:
 
 ```bash
 # OpenClaw Gateway
-GATEWAY_URL=http://localhost:18789
-GATEWAY_HOOK_TOKEN=your-secure-token
+GATEWAY_URL=ws://localhost:18789
+GATEWAY_AUTH_TOKEN=your-secure-token
 GATEWAY_AGENT_ID=assistant
 GATEWAY_SESSION_PREFIX=voice:
 
@@ -195,8 +194,11 @@ WHISPER_MODEL=base
 # Text-to-Speech (Piper)
 PIPER_URL=http://piper:5002
 PIPER_VOICE_ID=en_US-amy-medium
-PIPER_RATE=1.0
-PIPER_STABILITY=0.5
+
+# Audio Devices
+AUDIO_CAPTURE_DEVICE=default
+AUDIO_PLAYBACK_DEVICE=default
+AUDIO_PLAYBACK=auto
 
 # Audio Settings
 AUDIO_DEVICE=default
@@ -231,15 +233,15 @@ LOG_LEVEL=info
                        ▼
                 ┌─────────────┐
                 │  SENDING    │
-                │ (POST text) │
+                │ (WebSocket) │
                 └──────┬──────┘
-                       │ response from /hooks/agent
+                       │ agent response
                        ▼
                 ┌─────────────┐
                 │  WAITING    │
-                │   (poll)    │
+                │  (receive)  │
                 └──────┬──────┘
-                       │ new message in /chat.history
+                       │ TTS message received
                        ▼
                 ┌─────────────┐
                 │  SPEAKING   │
@@ -264,8 +266,8 @@ docker build -t openclaw-voice .
 ### Run Image
 ```bash
 docker run \
-  -e GATEWAY_URL=http://host.docker.internal:18789 \
-  -e GATEWAY_HOOK_TOKEN=token \
+  -e GATEWAY_URL=ws://host.docker.internal:18789 \
+  -e GATEWAY_AUTH_TOKEN=token \
   -e GATEWAY_AGENT_ID=assistant \
   --device /dev/snd \
   -v /run/user/1000/pulse:/run/user/1000/pulse:ro \

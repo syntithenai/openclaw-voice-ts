@@ -37,7 +37,6 @@ async function main() {
     // Validate required configuration
     const requiredEnvs = [
       'GATEWAY_URL',
-      'GATEWAY_HOOK_TOKEN',
       'GATEWAY_AGENT_ID',
     ];
     
@@ -60,18 +59,16 @@ async function main() {
     const orchestrator = new VoiceOrchestrator({
       sessionKey,
       gatewayUrl: process.env.GATEWAY_URL!,
-      gatewayToken: process.env.GATEWAY_AUTH_TOKEN || process.env.GATEWAY_HOOK_TOKEN!,
+      gatewayToken: process.env.GATEWAY_AUTH_TOKEN || process.env.GATEWAY_TOKEN || '',
       agentId: process.env.GATEWAY_AGENT_ID!,
       whisperUrl: process.env.WHISPER_URL,
       whisperLanguage: process.env.WHISPER_LANGUAGE,
       whisperModel: process.env.WHISPER_MODEL,
       piperUrl: process.env.PIPER_URL,
       piperVoiceId: process.env.PIPER_VOICE_ID,
-      audioDevice: process.env.AUDIO_DEVICE,
+      audioCaptureDevice: process.env.AUDIO_CAPTURE_DEVICE || process.env.AUDIO_DEVICE,
+      audioPlaybackDevice: process.env.AUDIO_PLAYBACK_DEVICE || process.env.AUDIO_DEVICE,
       sampleRate: process.env.AUDIO_SAMPLE_RATE ? parseInt(process.env.AUDIO_SAMPLE_RATE) : 16000,
-      audioInputFile: process.env.AUDIO_INPUT_FILE,
-      audioInputFormat: (process.env.AUDIO_INPUT_FORMAT as 'wav' | 'raw') || 'wav',
-      audioInputLoop: process.env.AUDIO_INPUT_LOOP === 'true',
       vadSilenceThreshold: process.env.VAD_SILENCE_THRESHOLD
         ? parseFloat(process.env.VAD_SILENCE_THRESHOLD)
         : undefined,
@@ -113,80 +110,91 @@ async function main() {
         : undefined,
     }, logger);
 
-    const httpPort = process.env.VOICE_HTTP_PORT
-      ? parseInt(process.env.VOICE_HTTP_PORT, 10)
-      : 18910;
+    // HTTP control server (optional - only if VOICE_HTTP_PORT is set)
+    let server: http.Server | null = null;
+    
+    if (process.env.VOICE_HTTP_PORT) {
+      const httpPort = parseInt(process.env.VOICE_HTTP_PORT, 10);
 
-    const server = http.createServer((req, res) => {
-      const method = req.method || 'GET';
-      const url = req.url || '/';
+      server = http.createServer((req, res) => {
+        const method = req.method || 'GET';
+        const url = req.url || '/';
 
-      if (method === 'GET' && url === '/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-        return;
-      }
+        if (method === 'GET' && url === '/health') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
 
-      if (method === 'GET' && url === '/status') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(orchestrator.getStatus()));
-        return;
-      }
+        if (method === 'GET' && url === '/status') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(orchestrator.getStatus()));
+          return;
+        }
 
-      if (method === 'POST' && url === '/control/start') {
-        orchestrator.setCaptureEnabled(true);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, captureEnabled: true }));
-        return;
-      }
+        if (method === 'POST' && url === '/control/start') {
+          orchestrator.setCaptureEnabled(true);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, captureEnabled: true }));
+          return;
+        }
 
-      if (method === 'POST' && url === '/control/stop') {
-        orchestrator.setCaptureEnabled(false);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, captureEnabled: false }));
-        return;
-      }
+        if (method === 'POST' && url === '/control/stop') {
+          orchestrator.setCaptureEnabled(false);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, captureEnabled: false }));
+          return;
+        }
 
-      if (method === 'POST' && url === '/control/sleep') {
-        orchestrator.setAwakeState(false);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, isAwake: false }));
-        return;
-      }
+        if (method === 'POST' && url === '/control/sleep') {
+          orchestrator.setAwakeState(false);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, isAwake: false }));
+          return;
+        }
 
-      if (method === 'POST' && url === '/control/wake') {
-        orchestrator.setAwakeState(true);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, isAwake: true }));
-        return;
-      }
+        if (method === 'POST' && url === '/control/wake') {
+          orchestrator.setAwakeState(true);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, isAwake: true }));
+          return;
+        }
 
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found' }));
-    });
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
+      });
 
-    server.listen(httpPort, () => {
-      logger.info(`Voice control HTTP server listening on port ${httpPort}`);
-    });
+      server.listen(httpPort, () => {
+        logger.info(`Voice control HTTP server listening on port ${httpPort}`);
+      });
+    } else {
+      logger.info('HTTP control server disabled (VOICE_HTTP_PORT not set)');
+    }
     
     // Handle graceful shutdown
     process.on('SIGINT', () => {
       logger.info('SIGINT received, shutting down...');
       orchestrator.stop();
-      server.close();
+      if (server) {
+        server.close();
+      }
     });
     
     process.on('SIGTERM', () => {
       logger.info('SIGTERM received, shutting down...');
       orchestrator.stop();
-      server.close();
+      if (server) {
+        server.close();
+      }
     });
     
     const orchestratorPromise = orchestrator.start();
     await orchestratorPromise;
 
     logger.info('Voice service exiting');
-    server.close();
+    if (server) {
+      server.close();
+    }
     process.exit(0);
     
   } catch (error) {
