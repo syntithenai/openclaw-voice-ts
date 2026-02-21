@@ -16,6 +16,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# Install PulseAudio and ALSA utilities for audio capture/playback
+RUN apk add --no-cache pulseaudio-utils alsa-utils
+
 # Install runtime dependencies only
 COPY package.json package-lock.json* pnpm-lock.yaml* ./
 RUN npm install -g pnpm && pnpm install --prod --frozen-lockfile || npm install --omit=dev

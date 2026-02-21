@@ -1,5 +1,8 @@
 import { spawn } from 'child_process';
-import { PassThrough } from 'stream';
+import { randomUUID } from 'crypto';
+import { promises as fs } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 /**
  * Piper TTS integration for text-to-speech synthesis
@@ -9,6 +12,7 @@ import { PassThrough } from 'stream';
 export class TTSClient {
   private currentPlaybackProcess: any = null;
   private isSpeakingNow: boolean = false;
+  private currentTempFile: string | null = null;
   
   constructor(
     private piperUrl: string,
@@ -29,14 +33,27 @@ export class TTSClient {
   ): Promise<Buffer> {
     const voice = voiceId || this.defaultVoiceId;
     
-    const payload = {
+    const payload: Record<string, any> = {
       text,
-      voice,
-      ...(rate !== undefined && { rate }),
-      ...(stability !== undefined && { stability }),
     };
     
-    const response = await fetch(`${this.piperUrl}/api/tts`, {
+    // Only include voice if it's not the default (Piper -m flag handles default)
+    if (voiceId) {
+      payload.voice = voice;
+    }
+    
+    // Piper uses length_scale for speaking speed
+    if (rate !== undefined) {
+      payload.length_scale = rate;
+    }
+    
+    // Piper uses noise_scale for variability
+    if (stability !== undefined) {
+      payload.noise_scale = stability;
+    }
+    
+    // Piper HTTP API is at the root endpoint /
+    const response = await fetch(this.piperUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -50,41 +67,44 @@ export class TTSClient {
       );
     }
     
-    // Get audio data (assuming WAV format)
+    // Get audio data (WAV format)
     const buffer = await response.arrayBuffer();
     return Buffer.from(buffer);
   }
   
   /**
-   * Play audio using system player (aplay)
+    * Play audio using system player (paplay/aplay)
    * Starts playback and can be interrupted via stopPlayback()
    */
   async playAudio(audioBuffer: Buffer): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Use aplay (ALSA player) for audio playback
-      this.currentPlaybackProcess = spawn('aplay', [
-        '-v', // Show volume
-      ]);
-      
-      this.isSpeakingNow = true;
-      
-      this.currentPlaybackProcess.on('error', (error: Error) => {
-        this.isSpeakingNow = false;
-        reject(new Error(`Audio playback failed: ${error.message}`));
+      const player = this.resolvePlayerCommand();
+      const tempFile = join(tmpdir(), `tts-${randomUUID()}.wav`);
+      this.currentTempFile = tempFile;
+
+      void fs.writeFile(tempFile, audioBuffer).then(() => {
+        this.currentPlaybackProcess = spawn(player.command, [...player.args, tempFile]);
+        this.isSpeakingNow = true;
+
+        this.currentPlaybackProcess.on('error', (error: Error) => {
+          this.cleanupTempFile();
+          this.isSpeakingNow = false;
+          reject(new Error(`Audio playback failed: ${error.message}`));
+        });
+
+        this.currentPlaybackProcess.on('close', (code: number | null) => {
+          this.cleanupTempFile();
+          this.isSpeakingNow = false;
+          if (code === 0 || code === null) {
+            resolve();
+          } else {
+            reject(new Error(`Audio playback exited with code ${code}`));
+          }
+        });
+      }).catch((error) => {
+        this.cleanupTempFile();
+        reject(new Error(`Failed to write temp audio file: ${error.message}`));
       });
-      
-      this.currentPlaybackProcess.on('close', (code: number | null) => {
-        this.isSpeakingNow = false;
-        if (code === 0 || code === null) { // null = killed by us
-          resolve();
-        } else {
-          reject(new Error(`Audio playback exited with code ${code}`));
-        }
-      });
-      
-      // Write audio data
-      this.currentPlaybackProcess.stdin.write(audioBuffer);
-      this.currentPlaybackProcess.stdin.end();
     });
   }
   
@@ -103,6 +123,7 @@ export class TTSClient {
       }, 100);
       this.isSpeakingNow = false;
     }
+    this.cleanupTempFile();
   }
   
   /**
@@ -132,7 +153,7 @@ export class TTSClient {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000);
-      const response = await fetch(`${this.piperUrl}/api/voices`, {
+      const response = await fetch(`${this.piperUrl}/voices`, {
         method: 'GET',
         signal: controller.signal,
       });
@@ -140,6 +161,24 @@ export class TTSClient {
       return response.ok;
     } catch {
       return false;
+    }
+  }
+
+  private resolvePlayerCommand(): { command: string; args: string[] } {
+    const mode = (process.env.AUDIO_PLAYBACK || 'auto').toLowerCase();
+    const hasPulse = Boolean(process.env.PULSE_SERVER || process.env.XDG_RUNTIME_DIR);
+
+    if (mode === 'pulse' || (mode === 'auto' && hasPulse)) {
+      return { command: 'paplay', args: [] };
+    }
+
+    return { command: 'aplay', args: ['-q'] };
+  }
+
+  private cleanupTempFile(): void {
+    if (this.currentTempFile) {
+      void fs.unlink(this.currentTempFile).catch(() => undefined);
+      this.currentTempFile = null;
     }
   }
 }

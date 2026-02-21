@@ -12,3 +12,5 @@ npm-debug.log*
 *.swo
 coverage/
 .tsbuildinfo
+whisper-models/
+package-lock.json

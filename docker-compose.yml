@@ -5,30 +5,66 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: openclaw-voice
+    user: "1000:1000"
     
     depends_on:
       - whisper
       - piper
     
+    networks:
+      - default
+      - openclaw_default
+    
     environment:
       # Gateway configuration
       GATEWAY_URL: ${GATEWAY_URL:-http://openclaw-gateway:18789}
       GATEWAY_HOOK_TOKEN: ${GATEWAY_HOOK_TOKEN:-your-secure-token}
+      GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN}
       GATEWAY_AGENT_ID: assistant
       GATEWAY_SESSION_PREFIX: "voice:"
       
       # STT configuration
       WHISPER_URL: http://whisper:8080
       WHISPER_LANGUAGE: en
-      WHISPER_MODEL: base
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
       
       # TTS configuration
       PIPER_URL: http://piper:5000
       PIPER_VOICE_ID: en_US-amy-medium
+
+      # Audio input test mode
+      AUDIO_INPUT_FILE: ${AUDIO_INPUT_FILE}
+      AUDIO_INPUT_FORMAT: ${AUDIO_INPUT_FORMAT:-wav}
+      AUDIO_INPUT_LOOP: ${AUDIO_INPUT_LOOP:-false}
+
+      # Audio playback mode (auto|pulse|alsa)
+      AUDIO_PLAYBACK: ${AUDIO_PLAYBACK:-auto}
       
       # Audio configuration
-      AUDIO_DEVICE: default
-      AUDIO_SAMPLE_RATE: 16000
+      AUDIO_DEVICE: ${AUDIO_DEVICE:-default}
+      AUDIO_SAMPLE_RATE: ${AUDIO_SAMPLE_RATE:-16000}
+      PULSE_SERVER: unix:/run/user/1000/pulse/native
+      XDG_RUNTIME_DIR: /run/user/1000
+
+      # VAD tuning
+      VAD_SILENCE_THRESHOLD: ${VAD_SILENCE_THRESHOLD}
+      VAD_NOISE_FLOOR_THRESHOLD: ${VAD_NOISE_FLOOR_THRESHOLD}
+      VAD_MIN_SPEECH_MS: ${VAD_MIN_SPEECH_MS}
+      VAD_MIN_SILENCE_MS: ${VAD_MIN_SILENCE_MS}
+      VAD_DEBUG: ${VAD_DEBUG}
+      VAD_ABSOLUTE_RMS: ${VAD_ABSOLUTE_RMS}
+      VAD_ABSOLUTE_SILENCE_RMS: ${VAD_ABSOLUTE_SILENCE_RMS}
+      CUTIN_ABSOLUTE_RMS: ${CUTIN_ABSOLUTE_RMS}
+      CUTIN_MIN_SPEECH_MS: ${CUTIN_MIN_SPEECH_MS}
+
+      # Listening window
+      MAX_LISTEN_MS: ${MAX_LISTEN_MS}
+      PRE_ROLL_MS: ${PRE_ROLL_MS}
+      
+      # Wake word timeout system (optional)
+      WAKE_WORD: ${WAKE_WORD}
+      WAKE_WORD_TIMEOUT: ${WAKE_WORD_TIMEOUT}
+      SLEEP_PHRASE: ${SLEEP_PHRASE}
       
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -36,13 +72,20 @@ services:
     # Mount PulseAudio for audio capture/playback
     volumes:
       # PulseAudio socket (Linux)
-      - /run/user/1000/pulse:/run/user/1000/pulse:ro
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      # PulseAudio auth cookie
+      - /home/stever/.config/pulse/cookie:/home/node/.config/pulse/cookie:ro
       # ALSA config (fallback)
       - /etc/alsa:/etc/alsa:ro
+      # Optional test audio input files
+      - ./test-data:/test-data:ro
     
     # Audio device access
     devices:
       - /dev/snd:/dev/snd
+    
+    group_add:
+      - audio
     
     restart: unless-stopped
     logging:
@@ -51,29 +94,36 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Whisper STT service
+  # Whisper STT service (faster-whisper)
   whisper:
     restart: unless-stopped
     build:
-      context: ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/whisper
+      context: ./docker/whisper
       dockerfile: Dockerfile
     ports:
       - "8086:8080"
     environment:
-      - WHISPER_MODEL=base
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
       - HSA_ENABLE_SDMA=0
       - AMD_SERIALIZE_KERNEL=3
+    volumes:
+      - ./whisper-models:/models
 
   # Piper TTS HTTP service
   piper:
     restart: unless-stopped
     build:
-      context: ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/piper1-gpl
+      context: ./docker/piper1-gpl
       dockerfile: Dockerfile
     command: ["server", "--model", "en_US-amy-medium"]
     ports:
       - "5002:5000"
     volumes:
-      - ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/piper-models:/home/piper/.local/share/piper
-      - ${OPENCLAW_BASE_DIR:-..}/openclaw/docker/piper-data:/data
+      - ./docker/piper-models:/home/piper/.local/share/piper
+      - ./docker/piper-data:/data
+
+networks:
+  openclaw_default:
+    external: true

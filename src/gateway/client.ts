@@ -46,7 +46,7 @@ export class GatewayClient {
     const payload = {
       sessionKey: this.formatSessionKey(sessionKey),
       agentId: this.agentId,
-      userMessage: transcribedText,
+      message: transcribedText,
     };
     
     const response = await fetch(endpoint, {

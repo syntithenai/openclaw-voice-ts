@@ -6,7 +6,7 @@ import { ChatMessage } from './client';
  */
 
 export interface TTSDirective {
-  voiceId: string;
+  voiceId?: string;
   rate?: number;
   stability?: number;
   text: string;

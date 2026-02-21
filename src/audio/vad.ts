@@ -5,6 +5,10 @@
 export interface VADConfig {
   /** Silence threshold multiplier (default 1.5) */
   silenceThreshold: number;
+  /** Absolute RMS threshold to force speech detection (default 0) */
+  absoluteSpeechRms: number;
+  /** Absolute RMS threshold below which speech is forced off (default 0) */
+  absoluteSilenceRms: number;
   /** Minimum silence duration in ms (default 400) */
   minSilenceDuration: number;
   /** Minimum speech duration in ms before silence can end it (default 200) */
@@ -29,6 +33,8 @@ export class VoiceActivityDetector {
   ) {
     this.config = {
       silenceThreshold: 1.5,
+      absoluteSpeechRms: 0,
+      absoluteSilenceRms: 0,
       minSilenceDuration: 400,
       minSpeechDuration: 200,
       noiseFloorAlphaSmoothing: 0.1,
@@ -57,7 +63,10 @@ export class VoiceActivityDetector {
     
     // Detect if this frame has speech
     const threshold = this.noiseFloor * this.config.silenceThreshold;
-    const hasSpeech = rms > threshold;
+    let hasSpeech = rms > threshold || rms >= this.config.absoluteSpeechRms;
+    if (this.config.absoluteSilenceRms > 0 && rms < this.config.absoluteSilenceRms) {
+      hasSpeech = false;
+    }
     
     // Update timing
     if (this.lastFrameTime === 0) {
