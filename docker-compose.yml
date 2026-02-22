@@ -15,8 +15,11 @@ services:
       - default
       - openclaw_default
     
+    env_file:
+      - .env
+    
     environment:
-      # Provider selection (openclaw|zeroclaw|tinyclaw|ironclaw|mimiclaw)
+      # Provider selection (openclaw|zeroclaw|tinyclaw|ironclaw|mimiclaw|picoclaw|nanobot)
       VOICE_CLAW_PROVIDER: ${VOICE_CLAW_PROVIDER:-openclaw}
       VOICE_SESSION_PREFIX: ${VOICE_SESSION_PREFIX:-voice}
       VOICE_GATEWAY_TIMEOUT: ${VOICE_GATEWAY_TIMEOUT:-30000}
@@ -48,6 +51,16 @@ services:
       MIMICLAW_TELEGRAM_BOT_TOKEN: ${MIMICLAW_TELEGRAM_BOT_TOKEN}
       MIMICLAW_TELEGRAM_CHAT_ID: ${MIMICLAW_TELEGRAM_CHAT_ID}
       
+      # PicoClaw provider configuration (early-stage framework)
+      PICOCLAW_HOME: ${PICOCLAW_HOME:-/home/node/.picoclaw/workspace}
+      PICOCLAW_GATEWAY_URL: ${PICOCLAW_GATEWAY_URL}
+      PICOCLAW_AGENT_ID: ${PICOCLAW_AGENT_ID:-default}
+      
+      # NanoBot provider configuration (ultra-lightweight Python agent)
+      NANOBOT_HOME: ${NANOBOT_HOME:-/home/node/.nanobot}
+      NANOBOT_GATEWAY_URL: ${NANOBOT_GATEWAY_URL:-http://localhost:18790}
+      NANOBOT_AGENT_ID: ${NANOBOT_AGENT_ID}
+      
       # Legacy gateway configuration (backward compatibility)
       GATEWAY_URL: ${GATEWAY_URL:-http://openclaw-gateway:18789}
       GATEWAY_AUTH_TOKEN: ${GATEWAY_AUTH_TOKEN}
@@ -57,7 +70,7 @@ services:
       # STT configuration
       WHISPER_URL: http://whisper:8080
       WHISPER_LANGUAGE: en
-      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
       
       # TTS configuration
       PIPER_URL: http://piper:5000
@@ -94,7 +107,13 @@ services:
       # Wake word timeout system (optional)
       WAKE_WORD: ${WAKE_WORD}
       WAKE_WORD_TIMEOUT: ${WAKE_WORD_TIMEOUT}
+      WAKE_WORD_ENGINE: ${WAKE_WORD_ENGINE:-whisper}
       SLEEP_PHRASE: ${SLEEP_PHRASE}
+
+      # OpenWakeWord configuration (when WAKE_WORD_ENGINE=openwakeword)
+      OPENWAKEWORD_URL: ${OPENWAKEWORD_URL:-http://openwakeword:8082}
+      OPENWAKEWORD_CONFIDENCE_THRESHOLD: ${OPENWAKEWORD_CONFIDENCE_THRESHOLD:-0.5}
+      OPENWAKEWORD_ENABLE_DEBUG: ${OPENWAKEWORD_ENABLE_DEBUG:-false}
 
       # Voice control HTTP server
       VOICE_HTTP_PORT: ${VOICE_HTTP_PORT}
@@ -114,6 +133,10 @@ services:
       - ./test-data:/test-data:ro
       # TinyClaw queue directory (for file-based messaging)
       - ${HOME}/.tinyclaw:/home/node/.tinyclaw
+      # PicoClaw workspace (for file-based messaging)
+      - ${HOME}/.picoclaw:/home/node/.picoclaw
+      # NanoBot workspace (for file-based messaging)
+      - ${HOME}/.nanobot:/home/node/.nanobot
     
     # Audio device access
     devices:
@@ -161,6 +184,31 @@ services:
       - ./docker/piper-models:/home/piper/.local/share/piper
       - ./docker/piper-data:/data
 
+  # OpenWakeWord Service (optional - for fast wake word detection)
+  openwakeword:
+    restart: unless-stopped
+    build:
+      context: ./docker/openwakeword-wrapper
+      dockerfile: Dockerfile
+    container_name: openclaw-openwakeword
+    ports:
+      - "8082:8082"
+    environment:
+      OPENWAKEWORD_MODELS: /models
+      DETECTION_THRESHOLD: ${OPENWAKEWORD_CONFIDENCE_THRESHOLD:-0.5}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - openwakeword-models:/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
 networks:
   openclaw_default:
     external: true
+
+volumes:
+  openwakeword-models:

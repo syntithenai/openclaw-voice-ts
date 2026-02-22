@@ -32,13 +32,13 @@ export class VoiceActivityDetector {
     config: Partial<VADConfig> = {}
   ) {
     this.config = {
-      silenceThreshold: 1.5,
-      absoluteSpeechRms: 0,
-      absoluteSilenceRms: 0,
+      silenceThreshold: 1.2,
+      absoluteSpeechRms: 0.02,
+      absoluteSilenceRms: 0.01,
       minSilenceDuration: 400,
       minSpeechDuration: 200,
       noiseFloorAlphaSmoothing: 0.1,
-      noiseFloorThreshold: 0.02,
+      noiseFloorThreshold: 0.01,
       ...config,
     };
   }

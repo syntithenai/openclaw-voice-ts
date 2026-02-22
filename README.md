@@ -32,6 +32,8 @@ OpenClaw Voice supports multiple AI agent frameworks through a provider interfac
 | **TinyClaw** | File Queue | Embedded/IoT devices | File System | No network, message queueing via `~/.tinyclaw/queue/` |
 | **IronClaw** | WebSocket | Privacy-first systems | Bearer Token | E2E encrypted, PostgreSQL backend support |
 | **MimiClaw** | Dual Mode | ESP32 devices | WebSocket or Telegram | LAN via WebSocket or global via Telegram bot |
+| **PicoClaw** | File Queue | Go-based lightweight framework | File System | File-based messaging, gateway server included |
+| **NanoBot** | File Queue | Python-based agentic framework | File System | Python async agents, minimal footprint |
 
 **Quick Start**: 
 - Already running OpenClaw? Use default `VOICE_CLAW_PROVIDER=openclaw`
@@ -274,6 +276,32 @@ VOICE_CLAW_PROVIDER=mimiclaw
 MIMICLAW_USE_WEBSOCKET=false
 MIMICLAW_TELEGRAM_BOT_TOKEN=your-bot-token
 MIMICLAW_TELEGRAM_CHAT_ID=your-chat-id
+
+docker compose up --build
+```
+
+**PicoClaw**:
+```bash
+# Deploy PicoClaw gateway
+picoclaw gateway --port 9000
+
+# Edit .env
+VOICE_CLAW_PROVIDER=picoclaw
+PICOCLAW_GATEWAY_URL=http://localhost:9000
+PICOCLAW_HOME=~/.picoclaw/workspace
+
+docker compose up --build
+```
+
+**NanoBot**:
+```bash
+# Prepare NanoBot
+mkdir -p ~/.nanobot/workspace
+nanobot setup
+
+# Edit .env
+VOICE_CLAW_PROVIDER=nanobot
+NANOBOT_WORKSPACE_HOME=~/.nanobot/workspace
 
 docker compose up --build
 ```
@@ -681,6 +709,74 @@ Telegram:
 ```bash
 # Test bot token
 curl https://api.telegram.org/bot{YOUR_TOKEN}/getMe
+```
+
+#### 6. PicoClaw
+
+**Authentication Setup:**
+
+PicoClaw uses file-based messaging - no authentication token needed. Access is filesystem-based through the PicoClaw gateway HTTP interface.
+
+**Deploy PicoClaw Gateway:**
+```bash
+# Install PicoClaw (if not already installed)
+go get github.com/sipeed/picoclaw
+
+# Start PicoClaw gateway
+picoclaw gateway --port 9000 --workspace ~/.picoclaw/workspace
+```
+
+**Configure OpenClaw Voice:**
+```bash
+VOICE_CLAW_PROVIDER=picoclaw
+PICOCLAW_GATEWAY_URL=http://localhost:9000
+PICOCLAW_HOME=~/.picoclaw/workspace           # Path to PicoClaw workspace
+
+# Optional: Agent ID
+PICOCLAW_AGENT_ID=default                      # Which agent to route to
+```
+
+**Verification:**
+```bash
+# Check PicoClaw gateway is running
+curl http://localhost:9000/health
+
+# Verify workspace directory exists
+ls -la ~/.picoclaw/workspace/sessions/
+```
+
+#### 7. NanoBot
+
+**Authentication Setup:**
+
+NanoBot uses file-based messaging via Python async agents. No authentication token needed - access is filesystem-based.
+
+**Prepare NanoBot:**
+```bash
+# Install NanoBot (if not already installed)
+pip install nanobot
+
+# Initialize NanoBot workspace
+nanobot setup
+mkdir -p ~/.nanobot/workspace/sessions
+```
+
+**Configure OpenClaw Voice:**
+```bash
+VOICE_CLAW_PROVIDER=nanobot
+NANOBOT_WORKSPACE_HOME=~/.nanobot/workspace    # Path to NanoBot workspace
+
+# Optional: Agent ID
+NANOBOT_AGENT_ID=default                       # Which agent to route to
+```
+
+**Verification:**
+```bash
+# Check NanoBot workspace is accessible
+ls -la ~/.nanobot/workspace/
+
+# Verify sessions directory
+ls -la ~/.nanobot/workspace/sessions/
 ```
 
 ---
@@ -1375,6 +1471,133 @@ MIMICLAW_USE_WEBSOCKET=true
 MIMICLAW_USE_WEBSOCKET=false
 MIMICLAW_TELEGRAM_BOT_TOKEN=bot-token
 MIMICLAW_TELEGRAM_CHAT_ID=chat-id
+```
+
+### PicoClaw
+
+**Gateway not responding**:
+```bash
+# Check if gateway process is running
+ps aux | grep picoclaw
+
+# Restart gateway with verbose logging
+picoclaw gateway --port 9000 --workspace ~/.picoclaw/workspace --verbose
+
+# Verify gateway is listening
+netstat -tuln | grep 9000  # or: ss -tuln | grep 9000
+```
+
+**File not found in workspace**:
+```bash
+# Verify workspace path matches PICOCLAW_HOME configuration
+ls -la ~/.picoclaw/workspace/
+
+# Ensure sessions directory exists
+mkdir -p ~/.picoclaw/workspace/sessions
+
+# Check file permissions
+chmod 755 ~/.picoclaw/workspace
+chmod 755 ~/.picoclaw/workspace/sessions
+```
+
+**Messages not being processed**:
+```bash
+# Verify HTTP gateway URL is accessible
+curl http://localhost:9000/health
+
+# Check for stuck lock files
+ls -la ~/.picoclaw/workspace/*.lock
+
+# Verify gateway can read/write to workspace
+touch ~/.picoclaw/workspace/test.tmp && rm ~/.picoclaw/workspace/test.tmp
+```
+
+**Gateway returns 500 error**:
+```bash
+# Check gateway logs
+tail -f ~/.picoclaw/logs/gateway.log
+
+# Verify agent binary is reachable
+which picoclaw-agent
+
+# Test agent directly
+picoclaw-agent --health --workspace ~/.picoclaw/workspace
+```
+
+### NanoBot
+
+**Workspace not initialized**:
+```bash
+# Initialize NanoBot workspace
+nanobot setup
+
+# Verify structure created
+ls -la ~/.nanobot/workspace/
+ls -la ~/.nanobot/workspace/sessions/
+
+# Create missing directories
+mkdir -p ~/.nanobot/workspace/sessions
+mkdir -p ~/.nanobot/workspace/agents
+```
+
+**Python environment not found**:
+```bash
+# Ensure NanoBot Python package is installed
+pip install nanobot
+
+# Check Python version (3.8+ required)
+python --version
+
+# Verify nanobot command is available
+which nanobot
+
+# Test Python environment
+python -c "import nanobot; print(nanobot.__version__)"
+```
+
+**Sessions not being created**:
+```bash
+# Check workspace permissions
+chmod 755 ~/.nanobot/workspace
+chmod 755 ~/.nanobot/workspace/sessions
+
+# Verify disk space available
+df -h ~/.nanobot/
+
+# Test workspace write permission
+touch ~/.nanobot/workspace/test.tmp && rm ~/.nanobot/workspace/test.tmp
+
+# Check for Python errors in logs
+tail -f ~/.nanobot/workspace/logs/*.log
+```
+
+**Agent process crashes unexpectedly**:
+```bash
+# Check if Python is installed and accessible
+python3 --version
+
+# Verify NanoBot agent dependencies
+pip list | grep nanobot
+
+# Check system resources
+free -h  # Memory
+df -h    # Disk space
+
+# Run with verbose logging
+NANOBOT_LOG_LEVEL=DEBUG nanobot run --workspace ~/.nanobot/workspace
+```
+
+**Cannot read agent state**:
+```bash
+# Check agent state files exist
+ls -la ~/.nanobot/workspace/agents/*/
+
+# Verify file formats
+file ~/.nanobot/workspace/agents/*/*.json
+
+# Backup and reset if corrupted
+cp -r ~/.nanobot/workspace ~/.nanobot/workspace.backup
+rm -rf ~/.nanobot/workspace/agents/*/state.json
 ```
 
 ---

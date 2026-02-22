@@ -19,6 +19,7 @@ export class LinuxTTSClient implements AudioPlaybackInterface {
   private isSpeakingNow: boolean = false;
   private currentTempFile: string | null = null;
   private playbackDevice?: string;
+  private playbackCallback: ((buffer: Buffer) => void) | null = null;
   
   constructor(config: TTSClientConfig) {
     this.piperUrl = config.piperUrl.replace(/\/$/, '');
@@ -86,6 +87,11 @@ export class LinuxTTSClient implements AudioPlaybackInterface {
       const player = this.resolvePlayerCommand();
       const tempFile = join(tmpdir(), `tts-${randomUUID()}.wav`);
       this.currentTempFile = tempFile;
+
+      // Notify echo cancellation of playback buffer
+      if (this.playbackCallback) {
+        this.playbackCallback(audioBuffer);
+      }
 
       void fs.writeFile(tempFile, audioBuffer).then(() => {
         this.currentPlaybackProcess = spawn(player.command, [...player.args, tempFile]);
@@ -210,5 +216,12 @@ export class LinuxTTSClient implements AudioPlaybackInterface {
    */
   isSpeaking(): boolean {
     return this.isSpeakingNow;
+  }
+  
+  /**
+   * Set callback to receive playback audio for echo cancellation
+   */
+  setPlaybackCallback(callback: ((buffer: Buffer) => void) | null): void {
+    this.playbackCallback = callback;
   }
 }

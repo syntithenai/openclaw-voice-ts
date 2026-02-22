@@ -94,6 +94,15 @@ async function main() {
       cutInMinSpeechMs: process.env.CUTIN_MIN_SPEECH_MS
         ? parseInt(process.env.CUTIN_MIN_SPEECH_MS, 10)
         : undefined,
+      cutInTtsAbsoluteRms: process.env.CUTIN_TTS_ABSOLUTE_RMS
+        ? parseFloat(process.env.CUTIN_TTS_ABSOLUTE_RMS)
+        : undefined,
+      cutInTtsMinSpeechMs: process.env.CUTIN_TTS_MIN_SPEECH_MS
+        ? parseInt(process.env.CUTIN_TTS_MIN_SPEECH_MS, 10)
+        : undefined,
+      postTtsListenMs: process.env.POST_TTS_LISTEN_MS
+        ? parseInt(process.env.POST_TTS_LISTEN_MS, 10)
+        : undefined,
       ttsDedupeWindowMs: process.env.TTS_DEDUPE_WINDOW_MS
         ? parseInt(process.env.TTS_DEDUPE_WINDOW_MS, 10)
         : undefined,
@@ -101,12 +110,31 @@ async function main() {
       wakeWordTimeout: hasWakeWord && process.env.WAKE_WORD_TIMEOUT
         ? parseInt(process.env.WAKE_WORD_TIMEOUT, 10)
         : undefined,
+      wakeWordEngine: (process.env.WAKE_WORD_ENGINE as 'whisper' | 'openwakeword') || 'whisper',
+      openWakeWordUrl: process.env.OPENWAKEWORD_URL,
+      openWakeWordConfidenceThreshold: process.env.OPENWAKEWORD_CONFIDENCE_THRESHOLD
+        ? parseFloat(process.env.OPENWAKEWORD_CONFIDENCE_THRESHOLD)
+        : undefined,
+      openWakeWordDebug: process.env.OPENWAKEWORD_ENABLE_DEBUG === 'true',
       sleepPhrase: hasWakeWord ? (process.env.SLEEP_PHRASE || 'go to sleep') : undefined,
       maxListenMs: process.env.MAX_LISTEN_MS
         ? parseInt(process.env.MAX_LISTEN_MS, 10)
         : undefined,
       preRollMs: process.env.PRE_ROLL_MS
         ? parseInt(process.env.PRE_ROLL_MS, 10)
+        : undefined,
+      echoCancel: process.env.ECHO_CANCEL === 'true',
+      echoCancelAttenuation: process.env.ECHO_CANCEL_ATTENUATION
+        ? parseFloat(process.env.ECHO_CANCEL_ATTENUATION)
+        : undefined,
+      echoCancelTailLength: process.env.ECHO_CANCEL_TAIL_LENGTH
+        ? parseInt(process.env.ECHO_CANCEL_TAIL_LENGTH, 10)
+        : undefined,
+      echoCancelRecalibrateInterval: process.env.ECHO_CANCEL_RECALIBRATE_INTERVAL
+        ? parseInt(process.env.ECHO_CANCEL_RECALIBRATE_INTERVAL, 10)
+        : undefined,
+      echoCancelMinCorrelation: process.env.ECHO_CANCEL_MIN_CORRELATION
+        ? parseFloat(process.env.ECHO_CANCEL_MIN_CORRELATION)
         : undefined,
     }, logger);
 

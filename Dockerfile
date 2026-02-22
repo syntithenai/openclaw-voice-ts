@@ -4,7 +4,7 @@ FROM node:20-alpine AS builder
 WORKDIR /build
 
 COPY package.json package-lock.json* pnpm-lock.yaml* ./
-RUN npm install -g pnpm && pnpm install --frozen-lockfile || npm install
+RUN npm install -g pnpm && pnpm install --frozen-lockfile --ignore-scripts || npm install --ignore-scripts
 
 COPY tsconfig.json ./
 COPY src ./src
@@ -19,9 +19,9 @@ WORKDIR /app
 # Install PulseAudio and ALSA utilities for audio capture/playback
 RUN apk add --no-cache pulseaudio-utils alsa-utils
 
-# Install runtime dependencies only
+# Install runtime dependencies only (skip install scripts since optional-build.js isn't needed)
 COPY package.json package-lock.json* pnpm-lock.yaml* ./
-RUN npm install -g pnpm && pnpm install --prod --frozen-lockfile || npm install --omit=dev
+RUN npm install -g pnpm && pnpm install --prod --frozen-lockfile --ignore-scripts || npm install --omit=dev --ignore-scripts
 
 # Copy compiled code from builder
 COPY --from=builder /build/dist ./dist

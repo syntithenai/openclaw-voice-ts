@@ -61,4 +61,4 @@ export interface ClawGateway {
   getProviderType(): ClawProviderType;
 }
 
-export type ClawProviderType = 'openclaw' | 'zeroclaw' | 'tinyclaw' | 'ironclaw' | 'mimiclaw';
+export type ClawProviderType = 'openclaw' | 'zeroclaw' | 'tinyclaw' | 'ironclaw' | 'mimiclaw' | 'picoclaw' | 'nanobot';

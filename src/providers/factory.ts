@@ -8,6 +8,8 @@ import { ZeroClawGateway, ZeroClawConfig } from './gateways/zeroclaw';
 import { TinyClawGateway, TinyClawConfig } from './gateways/tinyclaw';
 import { IronClawGateway, IronClawConfig } from './gateways/ironclaw';
 import { MimiClawGateway, MimiClawConfig } from './gateways/mimiclaw';
+import { PicoClawGateway, PicoClawConfig } from './gateways/picoclaw';
+import { NanoBotGateway, NanoBotConfig } from './gateways/nanobot';
 
 export interface GatewayConfig {
   provider: ClawProviderType;
@@ -28,6 +30,12 @@ export interface GatewayConfig {
   
   // MimiClaw
   mimiclaw?: MimiClawConfig;
+  
+  // PicoClaw
+  picoclaw?: PicoClawConfig;
+  
+  // NanoBot
+  nanobot?: NanoBotConfig;
 }
 
 /**
@@ -78,6 +86,24 @@ export function createGateway(config: GatewayConfig): ClawGateway {
       return new MimiClawGateway({
         timeout: config.timeout,
         ...config.mimiclaw,
+      });
+
+    case 'picoclaw':
+      if (!config.picoclaw) {
+        throw new Error('PicoClaw configuration missing');
+      }
+      return new PicoClawGateway({
+        timeout: config.timeout,
+        ...config.picoclaw,
+      });
+
+    case 'nanobot':
+      if (!config.nanobot) {
+        throw new Error('NanoBot configuration missing');
+      }
+      return new NanoBotGateway({
+        timeout: config.timeout,
+        ...config.nanobot,
       });
 
     default:
@@ -137,6 +163,22 @@ export function loadGatewayConfig(): GatewayConfig {
           ? parseInt(process.env.MIMICLAW_DEVICE_PORT, 10)
           : 18789,
         useWebSocket: process.env.MIMICLAW_USE_WEBSOCKET !== 'false',
+      };
+      break;
+
+    case 'picoclaw':
+      baseConfig.picoclaw = {
+        workspaceHome: process.env.PICOCLAW_HOME || `${process.env.HOME}/.picoclaw/workspace`,
+        gatewayUrl: process.env.PICOCLAW_GATEWAY_URL,
+        agentId: process.env.PICOCLAW_AGENT_ID,
+      };
+      break;
+
+    case 'nanobot':
+      baseConfig.nanobot = {
+        workspaceHome: process.env.NANOBOT_HOME || `${process.env.HOME}/.nanobot`,
+        gatewayUrl: process.env.NANOBOT_GATEWAY_URL || process.env.NANOBOT_GATEWAY_URL || 'http://localhost:18790',
+        agentId: process.env.NANOBOT_AGENT_ID,
       };
       break;
   }

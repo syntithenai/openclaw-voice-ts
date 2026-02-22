@@ -68,6 +68,10 @@ export class TTSClient {
   async healthCheck(): Promise<boolean> {
     return this.impl.healthCheck();
   }
+  
+  setPlaybackCallback(callback: ((buffer: Buffer) => void) | null): void {
+    this.impl.setPlaybackCallback(callback);
+  }
 }
 
 /**

@@ -72,6 +72,12 @@ export interface AudioPlaybackInterface {
    * Health check for audio system
    */
   healthCheck(): Promise<boolean>;
+  
+  /**
+   * Set callback to receive playback audio for echo cancellation
+   * Called when audio starts playing with the WAV buffer
+   */
+  setPlaybackCallback(callback: ((buffer: Buffer) => void) | null): void;
 }
 
 /**

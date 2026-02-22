@@ -179,6 +179,15 @@ export class WindowsTTSClient implements AudioPlaybackInterface {
   }
   
   /**
+   * Set callback to receive playback audio for echo cancellation
+   * Note: Windows implementation - currently no-op (echo cancellation not implemented for Windows yet)
+   */
+  setPlaybackCallback(callback: ((buffer: Buffer) => void) | null): void {
+    // TODO: Implement echo cancellation for Windows WASAPI
+    // For now, this is a no-op to satisfy the interface
+  }
+  
+  /**
    * List available WASAPI playback devices (static utility)
    */
   static async listDevices(): Promise<Array<{ index: number; name: string; guid: string }>> {
