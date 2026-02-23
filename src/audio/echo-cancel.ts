@@ -527,4 +527,157 @@ export class EchoCanceller {
       reductionRatioOptimal,
     };
   }
+
+  /**
+   * Apply echo cancellation offline and return the cancelled audio buffer
+   * Uses cross-correlation to find optimal delay, then calculates optimal attenuation
+   */
+  cancelBufferWithOutput(
+    micBuffer: Buffer,
+    playbackWav: Buffer,
+  ): {
+    cancelled: Buffer;
+    rmsBefore: number;
+    rmsAfter: number;
+    reductionRatio: number;
+    optimalAttenuation: number;
+    delaySamples: number;
+  } | null {
+    if (!micBuffer || micBuffer.length === 0) {
+      return null;
+    }
+
+    const playbackPcm = this.extractPCMFromWav(playbackWav);
+    if (!playbackPcm) {
+      process.stderr.write(`[CANCEL-OFFLINE] Failed to extract PCM from playback WAV\n`);
+      return null;
+    }
+
+    const micSamples = new Int16Array(micBuffer.buffer, micBuffer.byteOffset, micBuffer.length / 2);
+    const pbSamples = new Int16Array(playbackPcm.buffer, playbackPcm.byteOffset, playbackPcm.length / 2);
+
+    process.stderr.write(`[CANCEL-OFFLINE] micSamples=${micSamples.length}, pbSamples=${pbSamples.length}\n`);
+
+    // Search for optimal delay using cross-correlation
+    const minDelay = 0;
+    const maxDelay = Math.min(Math.round(this.config.sampleRate * 0.5), micSamples.length - 1000); // Search up to 500ms
+    let bestDelay = Math.round((this.estimatedDelayMs / 1000) * this.config.sampleRate);
+    let bestCorrelation = -Infinity;
+
+    // Coarse search every 100 samples
+    for (let delay = minDelay; delay <= maxDelay; delay += 100) {
+      let correlation = 0;
+      let micEnergy = 0;
+      let pbEnergy = 0;
+      
+      const searchLength = Math.min(10000, micSamples.length - delay, pbSamples.length);
+      
+      for (let i = 0; i < searchLength; i++) {
+        const mic = micSamples[i + delay] / 32768;
+        const pb = i < pbSamples.length ? pbSamples[i] / 32768 : 0;
+        
+        correlation += mic * pb;
+        micEnergy += mic * mic;
+        pbEnergy += pb * pb;
+      }
+      
+      // Normalize correlation
+      const normalizedCorr = (micEnergy > 0 && pbEnergy > 0) 
+        ? correlation / Math.sqrt(micEnergy * pbEnergy) 
+        : 0;
+      
+      if (normalizedCorr > bestCorrelation) {
+        bestCorrelation = normalizedCorr;
+        bestDelay = delay;
+      }
+    }
+
+    // Fine search around best delay
+    const fineMin = Math.max(0, bestDelay - 100);
+    const fineMax = Math.min(maxDelay, bestDelay + 100);
+    
+    for (let delay = fineMin; delay <= fineMax; delay += 10) {
+      let correlation = 0;
+      let micEnergy = 0;
+      let pbEnergy = 0;
+      
+      const searchLength = Math.min(10000, micSamples.length - delay, pbSamples.length);
+      
+      for (let i = 0; i < searchLength; i++) {
+        const mic = micSamples[i + delay] / 32768;
+        const pb = i < pbSamples.length ? pbSamples[i] / 32768 : 0;
+        
+        correlation += mic * pb;
+        micEnergy += mic * mic;
+        pbEnergy += pb * pb;
+      }
+      
+      const normalizedCorr = (micEnergy > 0 && pbEnergy > 0) 
+        ? correlation / Math.sqrt(micEnergy * pbEnergy) 
+        : 0;
+      
+      if (normalizedCorr > bestCorrelation) {
+        bestCorrelation = normalizedCorr;
+        bestDelay = delay;
+      }
+    }
+
+    const delaySamples = bestDelay;
+    const delayMs = (delaySamples / this.config.sampleRate) * 1000;
+
+    process.stderr.write(`[CANCEL-OFFLINE] Best delay found: ${delaySamples} samples (${delayMs.toFixed(1)}ms), correlation=${bestCorrelation.toFixed(4)}\n`);
+
+    // Calculate optimal attenuation via least squares using best delay
+    let dot = 0;
+    let pbEnergy = 0;
+    let sumBefore = 0;
+
+    for (let i = 0; i < micSamples.length; i++) {
+      const mic = micSamples[i] / 32768;
+      sumBefore += mic * mic;
+
+      const pbIndex = i - delaySamples;
+      const pb = pbIndex >= 0 && pbIndex < pbSamples.length ? pbSamples[pbIndex] / 32768 : 0;
+
+      dot += mic * pb;
+      pbEnergy += pb * pb;
+    }
+
+    const optimalAttenuation = pbEnergy > 1e-9 ? Math.min(1.2, Math.max(0, dot / pbEnergy)) : this.config.attenuation;
+
+    process.stderr.write(`[CANCEL-OFFLINE] optimalAttenuation=${optimalAttenuation.toFixed(4)}, configAttenuation=${this.config.attenuation}, pbEnergy=${pbEnergy.toFixed(6)}\n`);
+
+    // Apply echo cancellation with optimal attenuation
+    const cancelledSamples = new Int16Array(micSamples.length);
+    let sumAfter = 0;
+
+    for (let i = 0; i < micSamples.length; i++) {
+      const mic = micSamples[i] / 32768;
+      const pbIndex = i - delaySamples;
+      const pb = pbIndex >= 0 && pbIndex < pbSamples.length ? pbSamples[pbIndex] / 32768 : 0;
+      
+      const cancelled = mic - (optimalAttenuation * pb);
+      sumAfter += cancelled * cancelled;
+      
+      // Clamp to 16-bit range
+      cancelledSamples[i] = Math.max(-32768, Math.min(32767, Math.round(cancelled * 32768)));
+    }
+
+    const rmsBefore = Math.sqrt(sumBefore / micSamples.length);
+    const rmsAfter = Math.sqrt(sumAfter / micSamples.length);
+    const reductionRatio = rmsBefore > 0 ? (rmsBefore - rmsAfter) / rmsBefore : 0;
+
+    process.stderr.write(`[CANCEL-OFFLINE] rmsBefore=${rmsBefore.toFixed(6)}, rmsAfter=${rmsAfter.toFixed(6)}, reduction=${(reductionRatio * 100).toFixed(1)}%\n`);
+
+    const cancelledBuffer = Buffer.from(cancelledSamples.buffer, cancelledSamples.byteOffset, cancelledSamples.byteLength);
+
+    return {
+      cancelled: cancelledBuffer,
+      rmsBefore,
+      rmsAfter,
+      reductionRatio,
+      optimalAttenuation,
+      delaySamples,
+    };
+  }
 }

@@ -169,6 +169,10 @@ async function main() {
       echoCancelNlmsFilterLength: parseOptionalInt(process.env.ECHO_CANCEL_NLMS_FILTER_LENGTH),
       echoCancelUseWebRTCAEC: process.env.ECHO_CANCEL_USE_WEBRTC_AEC === 'true',
       echoCancelWebRTCAECStrength: (process.env.ECHO_CANCEL_WEBRTC_AEC_STRENGTH as 'weak' | 'medium' | 'strong' | undefined) || 'medium',
+      vadType: (process.env.VAD_TYPE as 'rms' | 'silero' | undefined) || 'rms',
+      sileroVadConfidenceThreshold: parseOptionalFloat(process.env.SILERO_VAD_CONFIDENCE_THRESHOLD),
+      sileroVadMinSpeechDuration: parseOptionalInt(process.env.SILERO_VAD_MIN_SPEECH_DURATION),
+      sileroVadMinSilenceDuration: parseOptionalInt(process.env.SILERO_VAD_MIN_SILENCE_DURATION),
     }, logger);
 
     // HTTP control server (optional - only if VOICE_HTTP_PORT is set)
@@ -276,6 +280,30 @@ async function main() {
             res.end(JSON.stringify(result));
           }).catch((error) => {
             logger.error('Echo cancellation verification failed:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: String(error) }));
+          });
+          return;
+        }
+
+        if (method === 'POST' && url === '/test/echo-cancellation-interactive') {
+          orchestrator.testEchoCancellationInteractive().then((result) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(result));
+          }).catch((error) => {
+            logger.error('Interactive echo cancellation test failed:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: String(error) }));
+          });
+          return;
+        }
+
+        if (method === 'POST' && url === '/test/tts-removal') {
+          orchestrator.testTtsRemoval().then((result) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(result));
+          }).catch((error) => {
+            logger.error('TTS removal test failed:', error);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: String(error) }));
           });

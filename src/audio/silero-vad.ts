@@ -6,7 +6,7 @@
 import * as ort from 'onnxruntime-node';
 import * as path from 'path';
 import * as fs from 'fs';
-import { Logger } from '../logger';
+import { Logger } from '../utils/logger';
 
 export interface SileroVADConfig {
   /** Confidence threshold 0-1 (default 0.5) */
@@ -29,10 +29,11 @@ export class SileroVoiceActivityDetector {
   private silenceDurationMs: number = 0;
   private speechDurationMs: number = 0;
   private lastFrameTime: number = 0;
-  private h: Float32Array = new Float32Array(2, 64); // Hidden state for RNN
-  private c: Float32Array = new Float32Array(2, 64); // Cell state for LSTM
-  private sr_int: Int64Array = new Int64Array([16000]); // Sample rate
+  private h: Float32Array = new Float32Array(2 * 64); // Hidden state for RNN
+  private c: Float32Array = new Float32Array(2 * 64); // Cell state for LSTM
+  private sr_int: BigInt64Array = new BigInt64Array([BigInt(16000)]); // Sample rate
   private initialized: boolean = false;
+  private lastConfidence: number = 0; // Cache last model output for synchronous access
 
   constructor(
     private sampleRate: number = 16000,
@@ -81,7 +82,7 @@ export class SileroVoiceActivityDetector {
 
   /**
    * Analyze audio frame and detect speech activity
-   * Note: This runs inference synchronously (no await needed)
+   * Returns immediately with cached result, queues async inference for next frame
    * Returns true if speech is currently being detected
    */
   analyze(frame: Buffer): boolean {
@@ -103,35 +104,47 @@ export class SileroVoiceActivityDetector {
       // Convert frame to float32 audio
       const audio = this.frameToFloat32(frame);
 
-      // Run inference synchronously (using sync API)
-      const inputs = {
-        input: new ort.Tensor('float32', audio, [1, audio.length]),
-        state_h: new ort.Tensor('float32', this.h, [2, 1, 64]),
-        state_c: new ort.Tensor('float32', this.c, [2, 1, 64]),
-        sr: new ort.Tensor('int64', this.sr_int, [1]),
-      };
+      // Queue async inference (non-blocking)
+      // Note: We'll use the result from the PREVIOUS frame for this one
+      // This small latency (one frame = 20ms) is acceptable for VAD
+      (async () => {
+        try {
+          if (!this.session) {
+            return; // Session was cleared
+          }
+          
+          const inputs = {
+            input: new ort.Tensor('float32', audio, [1, audio.length]),
+            state_h: new ort.Tensor('float32', this.h, [2, 1, 64]),
+            state_c: new ort.Tensor('float32', this.c, [2, 1, 64]),
+            sr: new ort.Tensor('int64', this.sr_int, [1]),
+          };
 
-      // Use runSync for synchronous inference
-      const output = this.session.runSync(inputs);
-      
-      // Extract confidence from output
-      const outputData = output.output.data as Float32Array;
-      const confidence = outputData[0];
+          // Use async run (non-blocking)
+          const output = await this.session.run(inputs);
+          
+          // Extract confidence from output
+          const outputData = output.output.data as Float32Array;
+          this.lastConfidence = outputData[0];
 
-      // Update hidden/cell states for next frame
-      if (output.state_h && output.state_h.data) {
-        this.h = new Float32Array(output.state_h.data as ArrayBuffer);
-      }
-      if (output.state_c && output.state_c.data) {
-        this.c = new Float32Array(output.state_c.data as ArrayBuffer);
-      }
+          // Update hidden/cell states for next frame
+          if (output.state_h && output.state_h.data) {
+            this.h = new Float32Array(output.state_h.data as any);
+          }
+          if (output.state_c && output.state_c.data) {
+            this.c = new Float32Array(output.state_c.data as any);
+          }
 
-      // Detect speech based on confidence threshold
-      const hasSpeech = confidence >= this.config.confidenceThreshold;
+          if (this.config.debug && Date.now() % 1000 < 50) {
+            this.logger.debug(`confidence=${this.lastConfidence.toFixed(3)}`);
+          }
+        } catch (error) {
+          this.logger.warn('Silero inference error:', error);
+        }
+      })();
 
-      if (this.config.debug && Date.now() % 1000 < 50) {
-        this.logger.debug(`confidence=${confidence.toFixed(3)}, speaking=${hasSpeech}`);
-      }
+      // Detect speech based on last computed confidence
+      const hasSpeech = this.lastConfidence >= this.config.confidenceThreshold;
 
       // Update speech/silence duration
       if (hasSpeech) {
@@ -154,12 +167,12 @@ export class SileroVoiceActivityDetector {
 
       if (wasStartingSpeech) {
         this.isCurrentlySpeaking = true;
-        this.logger.debug(`Speech started (confidence=${confidence.toFixed(3)})`);
+        this.logger.debug(`Speech started`);
       }
 
       if (wasEndingSpeech) {
         this.isCurrentlySpeaking = false;
-        this.logger.debug(`Speech ended (silence=${this.silenceDurationMs}ms)`);
+        this.logger.debug(`Speech ended`);
       }
 
       return this.isCurrentlySpeaking;

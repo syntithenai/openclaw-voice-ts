@@ -4,7 +4,7 @@
  */
 import { VoiceActivityDetector, VADConfig } from './vad';
 import { SileroVoiceActivityDetector, SileroVADConfig } from './silero-vad';
-import { Logger } from '../logger';
+import { Logger } from '../utils/logger';
 
 export type VADInstance = VoiceActivityDetector | SileroVoiceActivityDetector;
 

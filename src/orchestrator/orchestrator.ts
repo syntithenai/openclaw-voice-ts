@@ -354,6 +354,29 @@ export class VoiceOrchestrator {
         }
       }
       
+      // Initialize VAD using factory (supports both RMS and Silero)
+      const vadType: 'rms' | 'silero' = (this.config.vadType as 'rms' | 'silero') || 'rms';
+      const vadFactoryConfig: VADFactoryConfig = {
+        type: vadType,
+        rmsConfig: {
+          silenceThreshold: this.config.vadSilenceThreshold,
+          absoluteSpeechRms: this.config.vadAbsoluteRms,
+          absoluteSilenceRms: this.config.vadAbsoluteSilenceRms,
+          noiseFloorThreshold: this.config.vadNoiseFloorThreshold,
+          minSpeechDuration: this.config.vadMinSpeechMs,
+          minSilenceDuration: this.config.vadMinSilenceMs,
+        },
+        sileroConfig: {
+          confidenceThreshold: this.config.sileroVadConfidenceThreshold ?? 0.5,
+          minSpeechDuration: this.config.sileroVadMinSpeechDuration ?? 250,
+          minSilenceDuration: this.config.sileroVadMinSilenceDuration ?? 500,
+          debug: this.config.vadDebug,
+        },
+      };
+      
+      this.vad = await createVAD(this.config.sampleRate || 16000, vadFactoryConfig);
+      this.logger.info(`[VAD] Initialized with type="${vadType}"`);
+      
       // Start continuous audio stream ONCE
       this.audioStream = this.audioCapture.capture();
       this.logger.info('Audio stream started');
@@ -391,7 +414,7 @@ export class VoiceOrchestrator {
       this.logger.error('Fatal error in orchestrator:', error);
       this.setStateChange('error');
     } finally {
-      this.cleanup();
+      await this.cleanup();
     }
   }
   
@@ -1215,8 +1238,11 @@ export class VoiceOrchestrator {
           lastVadLog = Date.now();
           const rms = this.calculateRms(frame).toFixed(6);
           const state = this.vad.getState();
+          // VAD state varies by implementation (RMS vs Silero)
+          const noiseFloor = 'noiseFloor' in state ? (state as any).noiseFloor : 'N/A';
+          const threshold = 'threshold' in state ? (state as any).threshold : 'N/A';
           this.logger.info(
-            `VAD debug: rms=${rms} nf=${state.noiseFloor} thr=${state.threshold} speaking=${hasSpeech} buf=${this.audioBuffer.length}`
+            `VAD debug: rms=${rms} nf=${noiseFloor} thr=${threshold} speaking=${hasSpeech} buf=${this.audioBuffer.length}`
           );
         }
         
@@ -1546,8 +1572,15 @@ export class VoiceOrchestrator {
   /**
    * Cleanup resources
    */
-  private cleanup(): void {
+  private async cleanup(): Promise<void> {
     this.logger.info('Cleaning up resources');
+    
+    // Dispose VAD if it's Silero-based
+    try {
+      await disposeVAD(this.vad);
+    } catch (error) {
+      this.logger.warn('Error disposing VAD:', error);
+    }
     
     // Clear gateway text buffer timeout
     if (this.gatewayFlushTimeout) {
@@ -1798,6 +1831,260 @@ export class VoiceOrchestrator {
     }
   }
 
+  /**
+   * Interactive echo cancellation test
+   * Records user speaking while TTS plays, saves raw + echo-cancelled audio, then plays back
+   */
+  async testEchoCancellationInteractive(): Promise<{
+    ok: boolean;
+    message: string;
+    rawFilePath?: string;
+    cancelledFilePath?: string;
+    error?: string;
+  }> {
+    this.logger.info('[AEC-INTERACTIVE] Starting interactive echo cancellation test...');
+    
+    const fs = await import('fs');
+    const path = await import('path');
+    
+    // Prompt user to speak
+    const promptPhrase = 'Please speak into the microphone while I play some speech.';
+    const testPhrase = 'The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.';
+    const sampleRate = this.audioCapture.getSampleRate();
+    
+    try {
+      // Announce the test
+      const promptAudio = await this.ttsClient.synthesize(promptPhrase);
+      await this.ttsClient.playAudio(promptAudio);
+      
+      // Wait 1 second for user to prepare
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Start capturing raw audio
+      this.logger.info('[AEC-INTERACTIVE] Starting recording...');
+      this.isCapturingSpeech = true;
+      const capturePromise = this.captureRawAudioWindow(6000, true); // 6 seconds
+      
+      // Play TTS after a short delay
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const testAudio = await this.ttsClient.synthesize(testPhrase);
+      await this.ttsClient.playAudio(testAudio);
+      
+      // Wait for capture to complete
+      const micBufferRaw = await capturePromise;
+      this.isCapturingSpeech = false;
+      
+      if (!micBufferRaw || micBufferRaw.length === 0) {
+        return {
+          ok: false,
+          message: 'No audio captured',
+          error: 'Capture returned empty buffer',
+        };
+      }
+      
+      this.logger.info(`[AEC-INTERACTIVE] Captured ${micBufferRaw.length} bytes of raw audio`);
+      
+      // Apply echo cancellation offline using the new method
+      const result = this.echoCanceller.cancelBufferWithOutput(micBufferRaw, testAudio);
+      
+      if (!result) {
+        return {
+          ok: false,
+          message: 'Echo cancellation failed',
+          error: 'cancelBufferWithOutput returned null',
+        };
+      }
+      
+      const cancelledBuffer = result.cancelled;
+      const reductionPercent = (result.reductionRatio * 100).toFixed(1);
+      
+      this.logger.info(`[AEC-INTERACTIVE] Echo reduction: ${reductionPercent}%, optimal attenuation: ${result.optimalAttenuation.toFixed(2)}, delay: ${result.delaySamples} samples`);
+      
+      // Save both files
+      const timestampStr = new Date().toISOString().replace(/[:.]/g, '-');
+      const rawFilePath = `/tmp/echo-test-raw-${timestampStr}.wav`;
+      const cancelledFilePath = `/tmp/echo-test-cancelled-${timestampStr}.wav`;
+      
+      const rawWav = this.createWavFromSamples(micBufferRaw, sampleRate);
+      const cancelledWav = this.createWavFromSamples(cancelledBuffer, sampleRate);
+      
+      fs.writeFileSync(rawFilePath, rawWav);
+      fs.writeFileSync(cancelledFilePath, cancelledWav);
+      
+      this.logger.info(`[AEC-INTERACTIVE] Saved files:\n  Raw: ${rawFilePath}\n  Cancelled: ${cancelledFilePath}`);
+      
+      // Play back the echo-cancelled version
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const playbackPromptPhrase = `Now playing back the echo cancelled audio. Echo reduction was ${reductionPercent} percent.`;
+      const playbackPrompt = await this.ttsClient.synthesize(playbackPromptPhrase);
+      await this.ttsClient.playAudio(playbackPrompt);
+      
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await this.ttsClient.playAudio(cancelledWav);
+      
+      return {
+        ok: true,
+        message: `Echo cancellation test complete. Reduction: ${reductionPercent}%`,
+        rawFilePath,
+        cancelledFilePath,
+      };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[AEC-INTERACTIVE] Interactive test failed:', error);
+      return {
+        ok: false,
+        message: 'Test failed',
+        error: String(error),
+      };
+    }
+  }
+
+  /**
+   * TTS removal test - saves raw and TTS-removed audio for comparison
+   * Records while TTS plays and saves both versions to files
+   * Artificially adds TTS signal to the recording to simulate a scenario where
+   * TTS is bleeding into the microphone (for testing echo cancellation)
+   */
+  async testTtsRemoval(): Promise<{
+    ok: boolean;
+    message: string;
+    rawFilePath?: string;
+    cleanFilePath?: string;
+    reductionPercent?: number;
+    error?: string;
+  }> {
+    this.logger.info('[TTS-REMOVAL] Starting TTS removal test...');
+    
+    const fs = await import('fs');
+    
+    const testPhrase = 'The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. Sphinx of black quartz judge my vow.';
+    const sampleRate = this.audioCapture.getSampleRate();
+    
+    try {
+      // Start capturing raw audio
+      this.logger.info('[TTS-REMOVAL] Starting recording...');
+      this.isCapturingSpeech = true;
+      const capturePromise = this.captureRawAudioWindow(5000, true); // 5 seconds
+      
+      // Play TTS immediately
+      const testAudio = await this.ttsClient.synthesize(testPhrase);
+      await this.ttsClient.playAudio(testAudio);
+      
+      // Wait for capture to complete
+      const micBufferRaw = await capturePromise;
+      this.isCapturingSpeech = false;
+      
+      if (!micBufferRaw || micBufferRaw.length === 0) {
+        return {
+          ok: false,
+          message: 'No audio captured',
+          error: 'Capture returned empty buffer',
+        };
+      }
+      
+      this.logger.info(`[TTS-REMOVAL] Captured ${micBufferRaw.length} bytes of raw audio`);
+      
+      // For testing: artificially add TTS signal to the mic recording to simulate echo
+      // This lets us see how much the TTS removal reduces the signal
+      // Extract TTS PCM
+      const ttsPcm = this.extractPCMFromWav(testAudio);
+      if (!ttsPcm) {
+        return {
+          ok: false,
+          message: 'Failed to extract TTS audio',
+          error: 'Could not parse TTS WAV file',
+        };
+      }
+      
+      // Create a version with artificial echo by mixing in the TTS signal
+      const micSamples = new Int16Array(micBufferRaw.buffer, micBufferRaw.byteOffset, micBufferRaw.length / 2);
+      const ttsSamples = new Int16Array(ttsPcm.buffer, ttsPcm.byteOffset, ttsPcm.length / 2);
+      
+      const micWithEchoSamples = new Int16Array(micSamples.length);
+      
+      // Mix TTS signal into mic recording at various delays to simulate real echo
+      const delays = [2400, 4800, 7200]; // Different acoustic paths
+      const gains = [0.3, 0.15, 0.1]; // Progressively weaker echoes
+      
+      for (let i = 0; i < micSamples.length; i++) {
+        let combined = micSamples[i];
+        
+        // Add echoes at different delays
+        for (let d = 0; d < delays.length; d++) {
+          const delayIdx = i - delays[d];
+          if (delayIdx >= 0 && delayIdx < ttsSamples.length) {
+            combined += ttsSamples[delayIdx] * gains[d];
+          }
+        }
+        
+        // Clamp to 16-bit range
+        micWithEchoSamples[i] = Math.max(-32768, Math.min(32767, Math.round(combined)));
+      }
+      
+      const micWithEchoBuffer = Buffer.from(micWithEchoSamples.buffer, micWithEchoSamples.byteOffset, micWithEchoSamples.byteLength);
+      
+      this.logger.info(`[TTS-REMOVAL] Created synthetic echo by mixing TTS at delays: ${delays.join(', ')} samples`);
+      
+      // Apply TTS removal using echo cancellation
+      const result = this.echoCanceller.cancelBufferWithOutput(micWithEchoBuffer, testAudio);
+      
+      if (!result) {
+        return {
+          ok: false,
+          message: 'TTS removal failed',
+          error: 'cancelBufferWithOutput returned null',
+        };
+      }
+      
+      const cleanBuffer = result.cancelled;
+      const reductionPercent = Math.round(result.reductionRatio * 100);
+      
+      this.logger.info(`[TTS-REMOVAL] TTS removal: ${reductionPercent}% reduction, attenuation=${result.optimalAttenuation.toFixed(2)}, delay=${result.delaySamples} samples (${((result.delaySamples / sampleRate) * 1000).toFixed(1)}ms)`);
+      
+      // Save both files
+      const timestampStr = new Date().toISOString().replace(/[:.]/g, '-');
+      const rawFilePath = `/tmp/tts-removal-raw-${timestampStr}.wav`;
+      const cleanFilePath = `/tmp/tts-removal-clean-${timestampStr}.wav`;
+      
+      const rawWav = this.createWavFromSamples(micWithEchoBuffer, sampleRate);
+      const cleanWav = this.createWavFromSamples(cleanBuffer, sampleRate);
+      
+      fs.writeFileSync(rawFilePath, rawWav);
+      fs.writeFileSync(cleanFilePath, cleanWav);
+      
+      this.logger.info(`[TTS-REMOVAL] Saved files:\n  Raw (with TTS echo): ${rawFilePath}\n  Clean (TTS removed): ${cleanFilePath}`);
+      
+      return {
+        ok: true,
+        message: `TTS removal test complete. Removed ${reductionPercent}% of TTS signal.`,
+        rawFilePath,
+        cleanFilePath,
+        reductionPercent,
+      };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[TTS-REMOVAL] TTS removal test failed:', error);
+      return {
+        ok: false,
+        message: 'Test failed',
+        error: String(error),
+      };
+    }
+  }
+  
+  /**
+   * Extract PCM data from WAV buffer
+   */
+  private extractPCMFromWav(wavBuffer: Buffer): Buffer | null {
+    if (!wavBuffer || wavBuffer.length < 44) {
+      return null;
+    }
+    
+    // Skip WAV header (44 bytes) and return the PCM data
+    const dataStart = 44;
+    return wavBuffer.subarray(dataStart);
+  }
+
   async testAllCalibrationMethods(): Promise<any> {
     // Import calibration methods
     const {
@@ -1992,28 +2279,47 @@ export class VoiceOrchestrator {
   private createWavFromSamples(pcmBuffer: Buffer, sampleRate: number): Buffer {
     const channels = 1;
     const bitDepth = 16;
-    const byteRate = sampleRate * channels * (bitDepth / 8);
-    const blockAlign = channels * (bitDepth / 8);
+    const bytesPerSample = bitDepth / 8;
+    const byteRate = sampleRate * channels * bytesPerSample;
+    const blockAlign = channels * bytesPerSample;
 
-    const wav = Buffer.alloc(44 + pcmBuffer.length);
+    // Ensure PCM buffer is properly sized (must be multiple of 2 for 16-bit)
+    const pcmLength = pcmBuffer.length;
+    if (pcmLength % 2 !== 0) {
+      throw new Error(`PCM buffer length must be even (got ${pcmLength}), indicating misalignment`);
+    }
 
-    // WAV header
+    // Calculate format chunk size (always 16 for PCM)
+    const fmtChunkSize = 16;
+    const headerSize = 44; // RIFF header + fmt chunk
+
+    // Create WAV file buffer
+    const wav = Buffer.alloc(headerSize + pcmLength);
+
+    // RIFF header
     wav.write('RIFF', 0);
-    wav.writeUInt32LE(36 + pcmBuffer.length, 4);
+    // File size - 8 (RIFF + size field itself)
+    wav.writeUInt32LE(36 + pcmLength, 4);
     wav.write('WAVE', 8);
+
+    // Format chunk
     wav.write('fmt ', 12);
-    wav.writeUInt32LE(16, 16); // Subchunk1Size
-    wav.writeUInt16LE(1, 20); // AudioFormat (1 = PCM)
+    wav.writeUInt32LE(fmtChunkSize, 16); // Subchunk1Size = 16 for PCM
+    wav.writeUInt16LE(1, 20); // AudioFormat = 1 (PCM)
     wav.writeUInt16LE(channels, 22);
     wav.writeUInt32LE(sampleRate, 24);
     wav.writeUInt32LE(byteRate, 28);
     wav.writeUInt16LE(blockAlign, 32);
     wav.writeUInt16LE(bitDepth, 34);
+
+    // Data chunk
     wav.write('data', 36);
-    wav.writeUInt32LE(pcmBuffer.length, 40);
+    wav.writeUInt32LE(pcmLength, 40);
 
     // Copy PCM data
     pcmBuffer.copy(wav, 44);
+
+    this.logger.debug(`[WAV] Created WAV file: sampleRate=${sampleRate}, channels=${channels}, bitDepth=${bitDepth}, pcmLength=${pcmLength}, totalSize=${wav.length}`);
 
     return wav;
   }
