@@ -1,6 +1,8 @@
 import { AudioCapture } from '../audio/capture';
 import { VoiceActivityDetector } from '../audio/vad';
+import { createVAD, disposeVAD, VADInstance, VADFactoryConfig } from '../audio/vad-factory';
 import { EchoCanceller, EchoCancellationConfig } from '../audio/echo-cancel';
+import { AlignmentTester, AlignmentTestSignals, AlignmentTestResult, AlignmentDiagnostics } from '../audio/alignment-test';
 import { encodeWav } from '../audio/wav';
 import { generateClickSound } from '../audio/sounds';
 import { GatewayWSClient } from '../gateway/ws-client';
@@ -56,9 +58,26 @@ export interface OrchestratorConfig {
   audioInputLoop?: boolean;
   echoCancel?: boolean;
   echoCancelAttenuation?: number;
+  echoCancelAttenuationMin?: number;
+  echoCancelAttenuationMax?: number;
+  echoCancelTargetReductionMin?: number;
+  echoCancelTargetReductionMax?: number;
+  echoCancelAdaptiveAttenuation?: boolean;
   echoCancelTailLength?: number;
+  echoCancelDelayMs?: number;
   echoCancelRecalibrateInterval?: number;
   echoCancelMinCorrelation?: number;
+  echoCancelDriftThresholdMs?: number;
+  echoCancelCalibrationCooldownMs?: number;
+  echoCancelAutoCalibrate?: boolean;
+  echoCancelAdaptiveFiltering?: boolean;
+  echoCancelNlmsFilterLength?: number;
+  echoCancelUseWebRTCAEC?: boolean;
+  echoCancelWebRTCAECStrength?: 'weak' | 'medium' | 'strong';
+  vadType?: 'rms' | 'silero';
+  sileroVadConfidenceThreshold?: number;
+  sileroVadMinSpeechDuration?: number;
+  sileroVadMinSilenceDuration?: number;
 }
 
 interface BufferedFrame {
@@ -70,7 +89,7 @@ export class VoiceOrchestrator {
   private currentState: VoiceState = 'idle';
   private logger: Logger;
   private audioCapture: AudioCapture;
-  private vad: VoiceActivityDetector;
+  private vad: VADInstance;
   private echoCanceller: EchoCanceller;
   private gatewayClient: GatewayWSClient;
   private whisperClient: WhisperClient | null = null;
@@ -97,6 +116,7 @@ export class VoiceOrchestrator {
   
   // Circular audio buffer to prevent parecord blocking
   private audioBuffer: BufferedFrame[] = [];
+  private audioBufferRaw: BufferedFrame[] = [];
   private readonly maxBufferFrames: number = 300; // ~6 seconds at 20ms frames
   private bufferLock: boolean = false;
   private bufferSeq: number = 0;
@@ -113,6 +133,9 @@ export class VoiceOrchestrator {
   private isAwake: boolean = true;
   private lastActivityTime: number = Date.now();
   private lastTtsActivityTime: number = 0;
+  private isCapturingSpeech: boolean = false;
+  private lastPlaybackWav: Buffer | null = null;
+  private lastPlaybackAt: number = 0;
   
   // Wake word audio feedback
   private wakeClickSound: Buffer;
@@ -129,6 +152,7 @@ export class VoiceOrchestrator {
       1024
     );
     
+    // Placeholder - will be set by initialize()
     this.vad = new VoiceActivityDetector(config.sampleRate || 16000, {
       silenceThreshold: config.vadSilenceThreshold,
       absoluteSpeechRms: config.vadAbsoluteRms,
@@ -141,14 +165,26 @@ export class VoiceOrchestrator {
     // Initialize echo cancellation
     const aecConfig: EchoCancellationConfig = {
       enabled: config.echoCancel ?? false,
-      sampleRate: config.sampleRate || 48000,
+      sampleRate: config.sampleRate || 16000,
       frameSize: 1024,
       tailLength: config.echoCancelTailLength ?? 150,
       attenuation: config.echoCancelAttenuation ?? 0.7,
+      attenuationMin: config.echoCancelAttenuationMin,
+      attenuationMax: config.echoCancelAttenuationMax,
+      targetReductionMin: config.echoCancelTargetReductionMin,
+      targetReductionMax: config.echoCancelTargetReductionMax,
+      adaptiveAttenuation: config.echoCancelAdaptiveAttenuation,
+      initialDelayMs: config.echoCancelDelayMs,
       recalibrateInterval: config.echoCancelRecalibrateInterval ?? 0,
       minCorrelation: config.echoCancelMinCorrelation ?? 0.3,
+      driftThresholdMs: config.echoCancelDriftThresholdMs,
+      calibrationCooldownMs: config.echoCancelCalibrationCooldownMs,
+      adaptiveFiltering: config.echoCancelAdaptiveFiltering,
+      nlmsFilterLength: config.echoCancelNlmsFilterLength,
+      useWebRTCAEC: config.echoCancelUseWebRTCAEC,
+      webrtcAECStrength: config.echoCancelWebRTCAECStrength,
     };
-    console.error(`[ORCHESTRATOR-DEBUG] ECHO config: raw=${config.echoCancel}, aecEnabled=${aecConfig.enabled}, attenuation=${aecConfig.attenuation}`);
+    console.error(`[ORCHESTRATOR-DEBUG] ECHO config: raw=${config.echoCancel}, aecEnabled=${aecConfig.enabled}, attenuation=${aecConfig.attenuation}, adaptiveFiltering=${aecConfig.adaptiveFiltering}`);
     this.echoCanceller = new EchoCanceller(aecConfig);
     console.error(`[ORCHESTRATOR-DEBUG] EchoCanceller created successfully`);
     
@@ -262,6 +298,8 @@ export class VoiceOrchestrator {
     
     // Set up echo cancellation playback callback
     this.ttsClient.setPlaybackCallback((buffer: Buffer) => {
+      this.lastPlaybackWav = buffer;
+      this.lastPlaybackAt = Date.now();
       this.echoCanceller.addPlaybackAudio(buffer);
     });
     
@@ -321,14 +359,29 @@ export class VoiceOrchestrator {
       this.logger.info('Audio stream started');
       
       this.logger.info('Voice orchestrator started');
-      
+
+      const audioBufferTaskPromise = this.audioBufferTask();
+
+      if (this.config.echoCancelAutoCalibrate && this.config.echoCancel) {
+        this.logger.info('[AEC] Auto-calibration starting (requires mic to hear speakers)');
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const calibration = await this.calibrateEcho();
+        if (calibration.ok) {
+          this.logger.info(
+            `[AEC] Auto-calibration complete: delay=${calibration.delayMs?.toFixed(1)}ms corr=${calibration.correlation?.toFixed(3)}`,
+          );
+        } else {
+          this.logger.warn(`[AEC] Auto-calibration failed: ${calibration.error}`);
+        }
+      }
+
       // Run 4 parallel tasks:
       // 1. Audio buffer task (continuously drains parecord to prevent blocking)
       // 2. Continuous capture/transcribe/queue
       // 3. Message sender (drains queue to gateway)
       // 4. TTS player (plays queued responses)
       await Promise.all([
-        this.audioBufferTask(),
+        audioBufferTaskPromise,
         this.continuousCaptureLoop(),
         this.backgroundMessageSender(),
         this.backgroundTTSPlayer(),
@@ -407,7 +460,82 @@ export class VoiceOrchestrator {
       wakeWord: this.config.wakeWord,
       wakeWordTimeout: this.config.wakeWordTimeout,
       sleepPhrase: this.config.sleepPhrase,
+      echoCancel: this.config.echoCancel,
+      echoCancelStats: this.echoCanceller.getStats(),
     };
+  }
+
+  private generateCalibrationTone(durationMs: number, frequencyHz: number): Buffer {
+    const sampleRate = this.audioCapture.getSampleRate();
+    const totalSamples = Math.max(1, Math.floor((sampleRate * durationMs) / 1000));
+    const pcm = Buffer.alloc(totalSamples * 2);
+    const amplitude = 0.5;
+
+    for (let i = 0; i < totalSamples; i++) {
+      const sample = Math.sin((2 * Math.PI * frequencyHz * i) / sampleRate) * amplitude;
+      const intSample = Math.max(-1, Math.min(1, sample)) * 32767;
+      pcm.writeInt16LE(Math.round(intSample), i * 2);
+    }
+
+    return encodeWav(pcm, sampleRate);
+  }
+
+  private async captureRawAudioWindow(durationMs: number, useRaw: boolean = false): Promise<Buffer> {
+    const frames: Buffer[] = [];
+    const startTime = Date.now();
+    let cursor = this.bufferSeq;
+    const buffer = useRaw ? this.audioBufferRaw : this.audioBuffer;
+
+    while (this.isRunning && !this.shouldExit && Date.now() - startTime < durationMs) {
+      const nextFrame = this.getNextBufferedFrameFrom(buffer, cursor);
+      if (!nextFrame) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        continue;
+      }
+      cursor = nextFrame.idx + 1;
+      frames.push(nextFrame.data);
+    }
+
+    return frames.length > 0 ? Buffer.concat(frames) : Buffer.alloc(0);
+  }
+
+  async calibrateEcho(): Promise<{ ok: boolean; delayMs?: number; correlation?: number; error?: string }> {
+    if (!this.config.echoCancel) {
+      return { ok: false, error: 'Echo cancellation is disabled (ECHO_CANCEL=false).' };
+    }
+
+    if (this.ttsClient.isSpeaking()) {
+      return { ok: false, error: 'Calibration blocked while TTS is speaking.' };
+    }
+
+    const toneMs = 800;
+    const captureMs = toneMs + (this.config.echoCancelTailLength ?? 150) + 200;
+    const toneWav = this.generateCalibrationTone(toneMs, 1000);
+
+    this.isCapturingSpeech = true;
+    const capturePromise = this.captureRawAudioWindow(captureMs, true);
+
+    try {
+      await this.ttsClient.playAudio(toneWav);
+      const micBuffer = await capturePromise;
+      this.isCapturingSpeech = false;
+
+      if (!micBuffer || micBuffer.length === 0) {
+        return { ok: false, error: 'Calibration failed: no mic audio captured.' };
+      }
+
+      const result = this.echoCanceller.calibrateFromPlaybackCapture(micBuffer, toneWav);
+      if (!result) {
+        return { ok: false, error: 'Calibration failed: low correlation or invalid buffers.' };
+      }
+
+      this.lastActivityTime = Date.now();
+      return { ok: true, delayMs: result.delayMs, correlation: result.correlation };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('Echo calibration failed:', error);
+      return { ok: false, error: 'Calibration error; see logs for details.' };
+    }
   }
   
   /**
@@ -449,11 +577,17 @@ export class VoiceOrchestrator {
             await new Promise(resolve => setTimeout(resolve, 1));
           }
           
+          const nextIdx = this.bufferSeq++;
           const bufferedFrame: BufferedFrame = {
-            idx: this.bufferSeq++,
+            idx: nextIdx,
             data: processedFrame,
           };
+          const bufferedRawFrame: BufferedFrame = {
+            idx: nextIdx,
+            data: frame,
+          };
           this.audioBuffer.push(bufferedFrame);
+          this.audioBufferRaw.push(bufferedRawFrame);
           
           // Also maintain pre-roll buffer for continuity across utterances
           // This bridges pauses between wake word and command, and handles OpenWakeWord detection latency
@@ -465,6 +599,7 @@ export class VoiceOrchestrator {
           // Trim buffer if too large (keep most recent frames)
           if (this.audioBuffer.length > this.maxBufferFrames) {
             const dropped = this.audioBuffer.shift();
+            const droppedRaw = this.audioBufferRaw.shift();
             if (dropped) {
               if (this.captureCursor <= dropped.idx) {
                 this.captureCursor = dropped.idx + 1;
@@ -472,6 +607,9 @@ export class VoiceOrchestrator {
               if (this.cutInCursor <= dropped.idx) {
                 this.cutInCursor = dropped.idx + 1;
               }
+            }
+            if (droppedRaw && droppedRaw.idx !== dropped?.idx) {
+              this.logger.debug(`[BUFFER] Raw buffer desync: dropped idx=${droppedRaw.idx}, processed idx=${dropped?.idx}`);
             }
             droppedFrames++;
           }
@@ -568,12 +706,17 @@ export class VoiceOrchestrator {
           }
         }
         this.logger.debug(`[CAPTURE] Starting capture with maxListenMs=${maxListenMs}ms (isAwake=${this.isAwake})`);
+        this.isCapturingSpeech = true;
         const capturedAudio = await this.captureSpeechAudio(maxListenMs);
         if (!capturedAudio || capturedAudio.length === 0) {
+          this.isCapturingSpeech = false;
           continue;
         }
 
+        // Treat capture as activity so wake-word timeout doesn't fire mid-transcription
+        this.lastActivityTime = Date.now();
         const transcribedText = await this.transcribeCapturedAudio(capturedAudio);
+        this.isCapturingSpeech = false;
         
         if (!transcribedText.trim()) {
           continue; // Try again if nothing was said
@@ -587,6 +730,7 @@ export class VoiceOrchestrator {
         this.lastActivityTime = Date.now();
         
       } catch (error) {
+        this.isCapturingSpeech = false;
         this.logger.error('Error in capture loop:', error);
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
@@ -604,7 +748,7 @@ export class VoiceOrchestrator {
         // Check wake word timeout if configured (only when not actively doing TTS/speaking)
         if (this.config.wakeWordTimeout && this.isAwake && this.hasWakeWordConfigured()) {
           // Only apply timeout when truly idle - not during TTS synthesis or playback
-          if (!this.ttsClient.isSpeaking() && this.currentState !== 'speaking') {
+          if (!this.ttsClient.isSpeaking() && this.currentState !== 'speaking' && !this.isCapturingSpeech) {
             const timeSinceActivity = Date.now() - this.lastActivityTime;
             if (timeSinceActivity > this.config.wakeWordTimeout) {
               this.isAwake = false;
@@ -753,7 +897,13 @@ export class VoiceOrchestrator {
               // Wait a moment for TTS audio to fully clear from the microphone
               await new Promise(resolve => setTimeout(resolve, 500));
               
-              // Do not clear buffer here to avoid losing user speech around TTS completion
+              // Clear pre-roll buffer to prevent TTS audio from being included in next transcription
+              // The pre-roll buffer accumulated during TTS playback and contains TTS audio that we don't want transcribed
+              const clearedFrames = this.preRollBuffer.length;
+              this.preRollBuffer = [];
+              this.logger.info(`[TTS-END] Cleared pre-roll buffer (${clearedFrames} frames) to prevent TTS echo in transcription`);
+              
+              // Do not clear main buffer here to avoid losing user speech around TTS completion
               const postPlayBufferSize = this.audioBuffer.length;
               this.logger.info(`[TTS-END] Buffer size after TTS: ${postPlayBufferSize} frames`);
 
@@ -1131,6 +1281,18 @@ export class VoiceOrchestrator {
     return null;
   }
 
+  private getNextBufferedFrameFrom(buffer: BufferedFrame[], cursor: number): BufferedFrame | null {
+    if (buffer.length === 0) {
+      return null;
+    }
+    for (const frame of buffer) {
+      if (frame.idx >= cursor) {
+        return frame;
+      }
+    }
+    return null;
+  }
+
   private calculateRms(frame: Buffer): number {
     let sum = 0;
     const samples = frame.length / 2;
@@ -1396,5 +1558,475 @@ export class VoiceOrchestrator {
     this.audioCapture.stop();
     this.ttsClient.stopPlayback();
     this.gatewayClient.disconnect();
+  }
+
+  /**
+   * Test alignment using chirp signal
+   * Plays a frequency-sweep chirp and measures the acoustic delay
+   */
+  async testAlignmentWithChirp(): Promise<{
+    ok: boolean;
+    crossCorrelation: AlignmentTestResult;
+    rmsAlignment: AlignmentTestResult;
+    diagnostics: AlignmentDiagnostics;
+  }> {
+    this.logger.info('[ALIGNMENT-TEST] Starting chirp test...');
+    
+    const sampleRate = this.audioCapture.getSampleRate();
+    const chirpWav = AlignmentTestSignals.generateChirp(
+      sampleRate,
+      800,     // 800ms duration
+      100,     // start at 100Hz
+      4000,    // sweep to 4kHz
+      0.5,     // 50% amplitude
+    );
+    
+    this.isCapturingSpeech = true;
+    const capturePromise = this.captureRawAudioWindow(1000, true);
+    
+    try {
+      await this.ttsClient.playAudio(chirpWav);
+      const micBuffer = await capturePromise;
+      this.isCapturingSpeech = false;
+      
+      if (!micBuffer || micBuffer.length === 0) {
+        return {
+          ok: false,
+          crossCorrelation: { method: 'cross-correlation', delayMs: 0, confidence: 0, metadata: { error: 'No mic buffer' } },
+          rmsAlignment: { method: 'rms-alignment', delayMs: 0, confidence: 0, metadata: { error: 'No mic buffer' } },
+          diagnostics: {
+            playbackBufferSize: 0,
+            playbackFrameCount: 0,
+            playbackRmsHistory: [],
+            micRmsHistory: [],
+            correlationMap: [],
+            estimatedDelayMs: 0,
+          },
+        };
+      }
+      
+      const tester = new AlignmentTester(sampleRate, 1024);
+      const maxDelayMs = this.config.echoCancelTailLength ?? 150;
+      
+      const crossCorr = tester.testCrossCorrelation(micBuffer, chirpWav, maxDelayMs);
+      const rmsAlign = tester.testRmsAlignment(micBuffer, chirpWav, maxDelayMs);
+      const diagnostics = tester.generateDiagnostics(micBuffer, chirpWav, maxDelayMs);
+      
+      this.logger.info(
+        `[ALIGNMENT-TEST] Chirp results: ` +
+        `cross-corr delay=${crossCorr.delayMs.toFixed(1)}ms (conf=${crossCorr.confidence.toFixed(3)}), ` +
+        `rms-align delay=${rmsAlign.delayMs.toFixed(1)}ms (conf=${rmsAlign.confidence.toFixed(3)})`
+      );
+      
+      return {
+        ok: true,
+        crossCorrelation: crossCorr,
+        rmsAlignment: rmsAlign,
+        diagnostics,
+      };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[ALIGNMENT-TEST] Chirp test failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Test alignment using pulse sequence
+   * Plays a series of tone bursts to verify timing consistency
+   */
+  async testAlignmentWithPulse(): Promise<{
+    ok: boolean;
+    crossCorrelation: AlignmentTestResult;
+    rmsAlignment: AlignmentTestResult;
+    diagnostics: AlignmentDiagnostics;
+  }> {
+    this.logger.info('[ALIGNMENT-TEST] Starting pulse test...');
+    
+    const sampleRate = this.audioCapture.getSampleRate();
+    const pulseWav = AlignmentTestSignals.generatePulseSequence(
+      sampleRate,
+      5,       // 5 pulses
+      100,     // 100ms per pulse
+      150,     // 150ms gap
+      1000,    // 1kHz tone
+      0.5,     // 50% amplitude
+    );
+    
+    this.isCapturingSpeech = true;
+    const capturePromise = this.captureRawAudioWindow(1500, true);
+    
+    try {
+      await this.ttsClient.playAudio(pulseWav);
+      const micBuffer = await capturePromise;
+      this.isCapturingSpeech = false;
+      
+      if (!micBuffer || micBuffer.length === 0) {
+        return {
+          ok: false,
+          crossCorrelation: { method: 'cross-correlation', delayMs: 0, confidence: 0, metadata: { error: 'No mic buffer' } },
+          rmsAlignment: { method: 'rms-alignment', delayMs: 0, confidence: 0, metadata: { error: 'No mic buffer' } },
+          diagnostics: {
+            playbackBufferSize: 0,
+            playbackFrameCount: 0,
+            playbackRmsHistory: [],
+            micRmsHistory: [],
+            correlationMap: [],
+            estimatedDelayMs: 0,
+          },
+        };
+      }
+      
+      const tester = new AlignmentTester(sampleRate, 1024);
+      const maxDelayMs = this.config.echoCancelTailLength ?? 150;
+      
+      const crossCorr = tester.testCrossCorrelation(micBuffer, pulseWav, maxDelayMs);
+      const rmsAlign = tester.testRmsAlignment(micBuffer, pulseWav, maxDelayMs);
+      const diagnostics = tester.generateDiagnostics(micBuffer, pulseWav, maxDelayMs);
+      
+      this.logger.info(
+        `[ALIGNMENT-TEST] Pulse results: ` +
+        `cross-corr delay=${crossCorr.delayMs.toFixed(1)}ms (conf=${crossCorr.confidence.toFixed(3)}), ` +
+        `rms-align delay=${rmsAlign.delayMs.toFixed(1)}ms (conf=${rmsAlign.confidence.toFixed(3)})`
+      );
+      
+      return {
+        ok: true,
+        crossCorrelation: crossCorr,
+        rmsAlignment: rmsAlign,
+        diagnostics,
+      };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[ALIGNMENT-TEST] Pulse test failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get current alignment diagnostics
+   * Shows correlation map and RMS history without playing new signals
+   */
+  async getAlignmentDiagnostics(): Promise<AlignmentDiagnostics> {
+    const stats = this.echoCanceller.getStats();
+    const sampleRate = this.audioCapture.getSampleRate();
+    
+    // Get recent playback and mic data from buffers
+    const recentMicFrames = this.audioBufferRaw.slice(-50); // last 50 frames (~1 second)
+    const micRms = recentMicFrames.map(f => this.calculateRms(f.data));
+    
+    return {
+      playbackBufferSize: stats.playbackFrames * 2048, // approximate bytes
+      playbackFrameCount: stats.playbackFrames,
+      playbackRmsHistory: [],
+      micRmsHistory: micRms,
+      correlationMap: [],
+      estimatedDelayMs: stats.estimatedDelayMs,
+    };
+  }
+
+  /**
+   * Test echo cancellation effectiveness
+   * Plays TTS while monitoring RMS before and after AEC
+   */
+  async testEchoCancellationEffectiveness(): Promise<{
+    ok: boolean;
+    rmsBefore: number[];
+    rmsAfter: number[];
+    reductionRatio: number;
+    estimatedDelayMs: number;
+    optimalAttenuation?: number | null;
+    reductionRatioOptimal?: number | null;
+  }> {
+    this.logger.info('[AEC-TEST] Testing echo cancellation effectiveness...');
+    
+    const testPhrase = 'This is a test of echo cancellation. The quick brown fox jumps over the lazy dog.';
+    const sampleRate = this.audioCapture.getSampleRate();
+    
+    // Synthesize test TTS
+    const audioBuffer = await this.ttsClient.synthesize(testPhrase);
+    
+    // Capture raw mic audio while TTS plays
+    this.isCapturingSpeech = true;
+    const capturePromise = this.captureRawAudioWindow(3000, true);
+    
+    try {
+      await this.ttsClient.playAudio(audioBuffer);
+      const micBufferRaw = await capturePromise;
+      this.isCapturingSpeech = false;
+      
+      if (!micBufferRaw || micBufferRaw.length === 0) {
+        return {
+          ok: false,
+          rmsBefore: [],
+          rmsAfter: [],
+          reductionRatio: 0,
+          estimatedDelayMs: 0,
+        };
+      }
+
+      const rawFrames = this.splitIntoFrames(micBufferRaw);
+      const rmsBefore = rawFrames.map(f => this.calculateRms(f));
+      const avgBefore = rmsBefore.reduce((a, b) => a + b, 0) / rmsBefore.length;
+
+      const offlineResult = this.echoCanceller.cancelBuffer(micBufferRaw, audioBuffer);
+      const avgAfter = offlineResult?.rmsAfter ?? avgBefore;
+      const reductionRatio = offlineResult?.reductionRatio ?? 0;
+      // For display purposes, compute per-frame results assuming uniform reduction
+      const rmsAfter = reductionRatio > 0 ? rmsBefore.map(v => v * (1 - reductionRatio)) : rmsBefore;
+      
+      const stats = this.echoCanceller.getStats();
+      
+      this.logger.info(
+        `[AEC-TEST] Results: avgBefore=${avgBefore.toFixed(6)}, avgAfter=${avgAfter.toFixed(6)}, ` +
+        `reduction=${(reductionRatio * 100).toFixed(1)}%, delay=${stats.estimatedDelayMs.toFixed(1)}ms`
+      );
+      
+      return {
+        ok: true,
+        rmsBefore,
+        rmsAfter,
+        reductionRatio,
+        estimatedDelayMs: stats.estimatedDelayMs,
+        optimalAttenuation: offlineResult?.optimalAttenuation ?? null,
+        reductionRatioOptimal: offlineResult?.reductionRatioOptimal ?? null,
+      };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[AEC-TEST] Effectiveness test failed:', error);
+      throw error;
+    }
+  }
+
+  async testAllCalibrationMethods(): Promise<any> {
+    // Import calibration methods
+    const {
+      impulseResponseCalibration,
+      blindDeconvolutionCalibration,
+      ttsSpecificCalibration,
+      multiMethodCalibration,
+    } = await import('../audio/calibration-methods.js');
+
+    this.logger.info('[AEC-CAL] Running all calibration methods...');
+
+    const testPhrase = 'Test phrase for calibration';
+    const audioBuffer = await this.ttsClient.synthesize(testPhrase);
+
+    // Capture with AEC enabled
+    this.isCapturingSpeech = true;
+    const captureStart = Date.now();
+    const capturePromise = this.captureRawAudioWindow(3000, true);
+
+    try {
+      await this.ttsClient.playAudio(audioBuffer);
+      const micBufferRaw = await capturePromise;
+      this.isCapturingSpeech = false;
+
+      if (!micBufferRaw || micBufferRaw.length === 0) {
+        return { ok: false, error: 'No audio captured' };
+      }
+
+      const sampleRate = this.audioCapture.getSampleRate();
+
+      // Run ensemble calibration
+      const ensembleResult = await multiMethodCalibration(
+        micBufferRaw,
+        audioBuffer,
+        captureStart,
+        captureStart + 200, // Rough estimate
+        sampleRate,
+        100,
+        25,
+      );
+
+      this.logger.info(
+        `[AEC-CAL] Ensemble result: ${ensembleResult.delayMs.toFixed(1)}ms (confidence=${ensembleResult.confidence.toFixed(3)})`
+      );
+
+      return {
+        ok: true,
+        ensemble: {
+          delayMs: ensembleResult.delayMs,
+          confidence: ensembleResult.confidence,
+          methods: ensembleResult.ensemble.map((m) => ({
+            method: m.method,
+            delayMs: m.delayMs,
+            confidence: m.confidence,
+          })),
+        },
+      };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[AEC-CAL] Calibration methods test failed:', error);
+      throw error;
+    }
+  }
+
+  async testImpulseResponseCalibration(): Promise<any> {
+    const { impulseResponseCalibration } = await import('../audio/calibration-methods.js');
+
+    this.logger.info('[AEC-CAL] Testing impulse response calibration...');
+
+    // Generate a short click
+    const clickDuration = 0.05; // 50ms
+    const sampleRate = 16000;
+    const clickSamples = Math.floor((clickDuration * sampleRate) / 1000);
+    const clickBuf = new Int16Array(clickSamples);
+
+    // Create impulse (click)
+    clickBuf[0] = 32000; // Loud spike
+    for (let i = 1; i < clickSamples; i++) {
+      clickBuf[i] = Math.round(32000 * Math.exp(-i / 5000)); // Exponential decay
+    }
+
+    const clickWav = this.createWavFromSamples(
+      Buffer.from(clickBuf.buffer, clickBuf.byteOffset, clickBuf.byteLength),
+      sampleRate,
+    );
+
+    // Play click
+    this.isCapturingSpeech = true;
+    const playbackTime = Date.now();
+    const capturePromise = this.captureRawAudioWindow(1000, true); // Capture 1 second
+
+    try {
+      await this.ttsClient.playAudio(clickWav);
+      const micBuffer = await capturePromise;
+      this.isCapturingSpeech = false;
+
+      if (!micBuffer || micBuffer.length === 0) {
+        return { ok: false, error: 'No audio captured' };
+      }
+
+      const result = impulseResponseCalibration(micBuffer, 0, 50, sampleRate);
+
+      this.logger.info(`[AEC-CAL] Impulse result: ${result.delayMs.toFixed(1)}ms`);
+
+      return { ok: true, ...result };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[AEC-CAL] Impulse response calibration failed:', error);
+      throw error;
+    }
+  }
+
+  async testBlindDeconvolutionCalibration(): Promise<any> {
+    const { blindDeconvolutionCalibration } = await import('../audio/calibration-methods.js');
+
+    this.logger.info('[AEC-CAL] Testing blind deconvolution calibration...');
+
+    const testPhrase = 'Test signal for blind deconvolution';
+    const audioBuffer = await this.ttsClient.synthesize(testPhrase);
+
+    this.isCapturingSpeech = true;
+    const capturePromise = this.captureRawAudioWindow(3000, true);
+
+    try {
+      await this.ttsClient.playAudio(audioBuffer);
+      const micBuffer = await capturePromise;
+      this.isCapturingSpeech = false;
+
+      if (!micBuffer || micBuffer.length === 0) {
+        return { ok: false, error: 'No audio captured' };
+      }
+
+      const sampleRate = this.audioCapture.getSampleRate();
+      const result = blindDeconvolutionCalibration(
+        micBuffer,
+        audioBuffer,
+        sampleRate,
+        { min: 50, max: 300 },
+      );
+
+      this.logger.info(`[AEC-CAL] Blind deconv result: ${result.delayMs.toFixed(1)}ms`);
+
+      return { ok: true, ...result };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[AEC-CAL] Blind deconvolution calibration failed:', error);
+      throw error;
+    }
+  }
+
+  async testTtsSpecificCalibration(): Promise<any> {
+    const { ttsSpecificCalibration } = await import('../audio/calibration-methods.js');
+
+    this.logger.info('[AEC-CAL] Testing TTS-specific calibration...');
+
+    const testPhrase = 'Text to speech specific calibration test';
+    const audioBuffer = await this.ttsClient.synthesize(testPhrase);
+
+    this.isCapturingSpeech = true;
+    const playbackTime = Date.now();
+    const capturePromise = this.captureRawAudioWindow(3000, true);
+
+    try {
+      await this.ttsClient.playAudio(audioBuffer);
+      const captureTime = Date.now();
+      const micBuffer = await capturePromise;
+      this.isCapturingSpeech = false;
+
+      if (!micBuffer || micBuffer.length === 0) {
+        return { ok: false, error: 'No audio captured' };
+      }
+
+      const sampleRate = this.audioCapture.getSampleRate();
+      const result = ttsSpecificCalibration(
+        micBuffer,
+        audioBuffer,
+        playbackTime,
+        captureTime,
+        sampleRate,
+      );
+
+      this.logger.info(`[AEC-CAL] TTS-specific result: ${result.delayMs.toFixed(1)}ms`);
+
+      return { ok: true, ...result };
+    } catch (error) {
+      this.isCapturingSpeech = false;
+      this.logger.error('[AEC-CAL] TTS-specific calibration failed:', error);
+      throw error;
+    }
+  }
+
+  private createWavFromSamples(pcmBuffer: Buffer, sampleRate: number): Buffer {
+    const channels = 1;
+    const bitDepth = 16;
+    const byteRate = sampleRate * channels * (bitDepth / 8);
+    const blockAlign = channels * (bitDepth / 8);
+
+    const wav = Buffer.alloc(44 + pcmBuffer.length);
+
+    // WAV header
+    wav.write('RIFF', 0);
+    wav.writeUInt32LE(36 + pcmBuffer.length, 4);
+    wav.write('WAVE', 8);
+    wav.write('fmt ', 12);
+    wav.writeUInt32LE(16, 16); // Subchunk1Size
+    wav.writeUInt16LE(1, 20); // AudioFormat (1 = PCM)
+    wav.writeUInt16LE(channels, 22);
+    wav.writeUInt32LE(sampleRate, 24);
+    wav.writeUInt32LE(byteRate, 28);
+    wav.writeUInt16LE(blockAlign, 32);
+    wav.writeUInt16LE(bitDepth, 34);
+    wav.write('data', 36);
+    wav.writeUInt32LE(pcmBuffer.length, 40);
+
+    // Copy PCM data
+    pcmBuffer.copy(wav, 44);
+
+    return wav;
+  }
+
+  private splitIntoFrames(buffer: Buffer): Buffer[] {
+    const frames: Buffer[] = [];
+    const bytesPerFrame = 1024 * 2; // 16-bit samples
+    for (let i = 0; i < buffer.length; i += bytesPerFrame) {
+      const end = Math.min(i + bytesPerFrame, buffer.length);
+      if (end - i >= bytesPerFrame) {
+        frames.push(buffer.subarray(i, end));
+      }
+    }
+    return frames;
   }
 }

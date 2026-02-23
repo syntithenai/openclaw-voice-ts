@@ -17,7 +17,8 @@
   "dependencies": {
     "dotenv": "^16.3.1",
     "node-fetch": "^3.3.2",
-    "ws": "^8.16.0"
+    "ws": "^8.16.0",
+    "onnxruntime-node": "^1.17.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

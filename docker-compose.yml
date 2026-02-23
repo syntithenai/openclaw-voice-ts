@@ -11,10 +11,6 @@ services:
       - whisper
       - piper
     
-    networks:
-      - default
-      - openclaw_default
-    
     env_file:
       - .env
     
@@ -87,7 +83,9 @@ services:
       
       AUDIO_SAMPLE_RATE: ${AUDIO_SAMPLE_RATE:-16000}
       PULSE_SERVER: unix:/run/user/1000/pulse/native
+      PULSE_COOKIE: /home/node/.pulse-host/cookie
       XDG_RUNTIME_DIR: /run/user/1000
+      HOME: /home/node
 
       # VAD tuning
       VAD_SILENCE_THRESHOLD: ${VAD_SILENCE_THRESHOLD}
@@ -123,10 +121,14 @@ services:
     
     # Mount PulseAudio for audio capture/playback
     volumes:
-      # PulseAudio socket (Linux)
-      - /run/user/1000/pulse:/run/user/1000/pulse
-      # PulseAudio auth cookie
-      - /home/stever/.config/pulse/cookie:/home/node/.config/pulse/cookie:ro
+      # Source code (read-only for production, but mounted for development)
+      - ./src:/app/src:rw
+      # Note: dist is NOT mounted - it's built into the image
+      # This prevents the volume from wiping out the compiled code
+      # PulseAudio socket and runtime directory (Linux)
+      - /run/user/1000:/run/user/1000
+      # PulseAudio auth cookie (mount parent directory to preserve symlinks)
+      - /home/stever/.config/pulse:/home/node/.pulse-host:ro
       # ALSA config (fallback)
       - /etc/alsa:/etc/alsa:ro
       # Optional test audio input files
@@ -153,6 +155,16 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch(process.env.OPENCLAW_GATEWAY_URL||process.env.GATEWAY_URL||'http://openclaw-gateway:18789').then(()=>process.exit(0)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   # Whisper STT service (faster-whisper)
   whisper:
@@ -207,7 +219,8 @@ services:
       start_period: 60s
 
 networks:
-  openclaw_default:
+  default:
+    name: openclaw_default
     external: true
 
 volumes:

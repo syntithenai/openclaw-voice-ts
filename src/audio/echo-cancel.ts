@@ -4,14 +4,20 @@
  * Implements echo cancellation to prevent TTS playback from triggering
  * false cut-in detection by removing known playback signal from mic input.
  * 
- * Method: Static subtraction with cross-correlation time alignment
+ * Methods supported:
+ * 1. Fixed subtraction: Linear scaling of reference (simple, low CPU)  
+ * 2. Adaptive NLMS: Learns filter weights to match acoustic response (better, moderate CPU)
+ * 3. WebRTC AEC: Industry-standard echo cancellation (best quality, moderate CPU)
  * 
  * Flow:
  * 1. TTS playback buffer is stored with timestamp
  * 2. Mic frames are cross-correlated with playback buffer to find delay
- * 3. Time-aligned playback is subtracted from mic input
+ * 3. Time-aligned playback is processed through selected AEC engine
  * 4. Result is "echo-cancelled" audio for VAD/Whisper
  */
+
+import { NLMSFilter, NLMSConfig } from './nlms-filter';
+import { WebRTCAEC } from './webrtc-aec';
 
 interface PlaybackFrame {
   idx: number;
@@ -27,6 +33,18 @@ export interface EchoCancellationConfig {
   attenuation: number; // 0.0-1.0, how much to subtract, e.g., 0.7
   recalibrateInterval: number; // ms between auto-recalibration, 0=disabled
   minCorrelation: number; // minimum correlation to accept alignment, e.g., 0.3
+  attenuationMin?: number; // for adaptive attenuation
+  attenuationMax?: number; // for adaptive attenuation
+  targetReductionMin?: number; // for adaptive attenuation
+  targetReductionMax?: number; // for adaptive attenuation
+  adaptiveAttenuation?: boolean; // enable adaptive attenuation
+  initialDelayMs?: number; // initial delay value
+  driftThresholdMs?: number; // drift threshold for logging
+  calibrationCooldownMs?: number; // cooldown for calibration
+  adaptiveFiltering?: boolean; // enable NLMS adaptive filtering mode
+  nlmsFilterLength?: number; // NLMS filter taps (default 512 for 10ms @ 48kHz)
+  useWebRTCAEC?: boolean; // enable WebRTC AEC mode
+  webrtcAECStrength?: 'weak' | 'medium' | 'strong'; // WebRTC AEC aggressiveness
 }
 
 export class EchoCanceller {
@@ -36,12 +54,48 @@ export class EchoCanceller {
   private estimatedDelayMs: number = 0;
   private lastCalibrationTime: number = 0;
   private maxPlaybackFrames: number;
+  private nlmsFilter: NLMSFilter | null = null;
+  private useAdaptiveFiltering: boolean;
+  private webrtcAec: WebRTCAEC | null = null;
+  private useWebRTCAEC: boolean;
   
   constructor(config: EchoCancellationConfig) {
     this.config = config;
     // Calculate how many frames to keep based on tail length
     const msPerFrame = (config.frameSize / config.sampleRate) * 1000;
     this.maxPlaybackFrames = Math.ceil((config.tailLength + 500) / msPerFrame); // +500ms margin
+    
+    this.useAdaptiveFiltering = config.adaptiveFiltering ?? false;
+    this.useWebRTCAEC = config.useWebRTCAEC ?? false;
+
+    // Initialize WebRTC AEC if enabled
+    if (this.useWebRTCAEC) {
+      try {
+        this.webrtcAec = new WebRTCAEC(
+          config.sampleRate,
+          config.frameSize,
+          config.webrtcAECStrength ?? 'medium'
+        );
+        process.stderr.write(`[AEC] WebRTC AEC enabled (strength=${config.webrtcAECStrength ?? 'medium'})\n`);
+      } catch (error) {
+        process.stderr.write(`[AEC] WebRTC AEC initialization failed: ${error}\n`);
+        this.webrtcAec = null;
+        this.useWebRTCAEC = false;
+      }
+    }
+    
+    // Initialize NLMS if enabled (not mutually exclusive with WebRTC)
+    if (this.useAdaptiveFiltering) {
+      const nlmsConfig: NLMSConfig = {
+        filterLength: config.nlmsFilterLength ?? 512,
+        stepSize: 0.3,
+        regularization: 1e-8,
+        constrained: true,
+        leakage: 0.9999,
+      };
+      this.nlmsFilter = new NLMSFilter(nlmsConfig);
+      process.stderr.write(`[AEC] NLMS adaptive filtering enabled (${nlmsConfig.filterLength} taps, step=${nlmsConfig.stepSize})\n`);
+    }
     
     process.stderr.write(`[AEC] Initialized: enabled=${config.enabled}, attenuation=${config.attenuation}, tailLength=${config.tailLength}ms, maxFrames=${this.maxPlaybackFrames}\n`);
   }
@@ -79,6 +133,16 @@ export class EchoCanceller {
         timestamp: timestamp + (this.playbackBuffer.length * this.getFrameDurationMs()),
         data: frameData,
       });
+      
+      // Also push to NLMS reference buffer if enabled
+      if (this.useAdaptiveFiltering && this.nlmsFilter) {
+        this.nlmsFilter.pushReferenceFrame(frameData);
+      }
+      
+      // Also push to WebRTC AEC reference buffer if enabled
+      if (this.useWebRTCAEC && this.webrtcAec) {
+        this.webrtcAec.addFarendFrame(frameData);
+      }
     }
     
     // Trim old frames
@@ -118,8 +182,19 @@ export class EchoCanceller {
       return micFrame; // No matching playback, pass through
     }
     
-    // Subtract playback from mic
-    const cancelled = this.subtractFrames(micFrame, playbackFrame.data, this.config.attenuation);
+    // Apply echo cancellation (WebRTC AEC, NLMS, or fixed subtraction)
+    let cancelled: Buffer;
+    if (this.useWebRTCAEC && this.webrtcAec) {
+      // Process through WebRTC AEC
+      cancelled = this.webrtcAec.processFrame(micFrame);
+    } else if (this.useAdaptiveFiltering && this.nlmsFilter) {
+      // Process through NLMS adaptive filter
+      const result = this.nlmsFilter.processBuffer(micFrame);
+      cancelled = result.residuals;
+    } else {
+      // Fall back to fixed subtraction
+      cancelled = this.subtractFrames(micFrame, playbackFrame.data, this.config.attenuation);
+    }
     
     // Calculate RMS before and after to measure effectiveness
     const rmsBefore = this.calculateRms(micFrame);
@@ -357,6 +432,99 @@ export class EchoCanceller {
       playbackFrames: this.playbackBuffer.length,
       estimatedDelayMs: this.estimatedDelayMs,
       lastCalibrationMs: this.lastCalibrationTime,
+    };
+  }
+  /**
+   * Calibrate using playback capture (for testing)
+   */
+  calibrateFromPlaybackCapture(micBuffer: Buffer, playbackWav: Buffer): { delayMs: number; correlation: number } | null {
+    // Use the existing delay estimation
+    return {
+      delayMs: this.estimatedDelayMs,
+      correlation: 0.5, // Placeholder
+    };
+  }
+  /**
+   * Test echo cancellation offline using buffered audio
+   * Used for verification and calibration testing
+   */
+  cancelBuffer(
+    micBuffer: Buffer,
+    playbackWav: Buffer,
+  ): {
+    rmsBefore: number;
+    rmsAfter: number;
+    reductionRatio: number;
+    optimalAttenuation: number;
+    rmsAfterOptimal: number;
+    reductionRatioOptimal: number;
+  } | null {
+    if (!micBuffer || micBuffer.length === 0) {
+      return null;
+    }
+
+    const playbackPcm = this.extractPCMFromWav(playbackWav);
+    if (!playbackPcm) {
+      return null;
+    }
+
+    const micSamples = new Int16Array(micBuffer.buffer, micBuffer.byteOffset, micBuffer.length / 2);
+    const pbSamples = new Int16Array(playbackPcm.buffer, playbackPcm.byteOffset, playbackPcm.length / 2);
+
+    process.stderr.write(`[CANCEL-DEBUG] micSamples=${micSamples.length}, pbSamples=${pbSamples.length}, delayMs=${this.estimatedDelayMs}, atten=${this.config.attenuation}\n`);
+
+    // Find optimal alignment and attenuation using the estimated delay
+    const delaySamples = Math.max(0, Math.round((this.estimatedDelayMs / 1000) * this.config.sampleRate));
+    const attenuation = this.config.attenuation;
+
+    let sumBefore = 0;
+    let sumAfter = 0;
+    let dot = 0;
+    let pbEnergy = 0;
+
+    // Single pass to calculate fixed attenuation reduction
+    for (let i = 0; i < micSamples.length; i++) {
+      const mic = micSamples[i] / 32768;
+      sumBefore += mic * mic;
+
+      const pbIndex = i - delaySamples;
+      const pb = pbIndex >= 0 && pbIndex < pbSamples.length ? pbSamples[pbIndex] / 32768 : 0;
+
+      dot += mic * pb;
+      pbEnergy += pb * pb;
+
+      const cancelled = mic - (attenuation * pb);
+      sumAfter += cancelled * cancelled;
+    }
+
+    const rmsBefore = Math.sqrt(sumBefore / micSamples.length);
+    const rmsAfter = Math.sqrt(sumAfter / micSamples.length);
+    const reductionRatio = rmsBefore > 0 ? (rmsBefore - rmsAfter) / rmsBefore : 0;
+
+    process.stderr.write(`[CANCEL-DEBUG] sumBefore=${sumBefore.toFixed(6)}, sumAfter=${sumAfter.toFixed(6)}, rmsBefore=${rmsBefore.toFixed(6)}, rmsAfter=${rmsAfter.toFixed(6)}, ratio=${reductionRatio.toFixed(4)}\n`);
+
+    // Calculate optimal attenuation via least squares
+    const optimalAttenuation = pbEnergy > 1e-9 ? Math.min(1.2, Math.max(0, dot / pbEnergy)) : 0;
+
+    let sumAfterOptimal = 0;
+    for (let i = 0; i < micSamples.length; i++) {
+      const mic = micSamples[i] / 32768;
+      const pbIndex = i - delaySamples;
+      const pb = pbIndex >= 0 && pbIndex < pbSamples.length ? pbSamples[pbIndex] / 32768 : 0;
+      const cancelled = mic - (optimalAttenuation * pb);
+      sumAfterOptimal += cancelled * cancelled;
+    }
+
+    const rmsAfterOptimal = Math.sqrt(sumAfterOptimal / micSamples.length);
+    const reductionRatioOptimal = rmsBefore > 0 ? (rmsBefore - rmsAfterOptimal) / rmsBefore : 0;
+
+    return {
+      rmsBefore,
+      rmsAfter,
+      reductionRatio,
+      optimalAttenuation,
+      rmsAfterOptimal,
+      reductionRatioOptimal,
     };
   }
 }
